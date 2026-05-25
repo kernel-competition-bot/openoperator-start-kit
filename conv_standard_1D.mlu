@@ -1,0 +1,162 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define KERNEL_CHUNK 4096
+#define OUT_CHUNK 256
+
+__mlu_entry__ void conv1d_standard_kernel(
+    float *x,
+    float *kernel,
+    float *output,
+    int N, int Cin, int L,
+    int Cout, int K,
+    int stride, int padding, int dilation,
+    int groups, int Lout)
+{
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    int Cin_per_group = Cin / groups;
+    int Cout_per_group = Cout / groups;
+    int kernel_size_flat = Cin_per_group * K;
+
+    int total_work = N * Cout;
+    uint32_t per_core = total_work / core_num;
+    uint32_t remainder = total_work % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_kernel[KERNEL_CHUNK];
+    __nram__ float nram_patch[KERNEL_CHUNK];
+    __nram__ float nram_temp[KERNEL_CHUNK];
+    __nram__ float nram_acc[OUT_CHUNK];
+
+    for (uint32_t w = 0; w < count; w++) {
+        int work_idx = start + w;
+        int n = work_idx / Cout;
+        int oc = work_idx % Cout;
+
+        int g = oc / Cout_per_group;
+        int ic_start = g * Cin_per_group;
+
+        for (int lo_start = 0; lo_start < Lout; lo_start += OUT_CHUNK) {
+            int lo_end = (lo_start + OUT_CHUNK <= Lout)
+                             ? lo_start + OUT_CHUNK
+                             : Lout;
+            int lo_len = lo_end - lo_start;
+
+            for (int i = 0; i < lo_len; i++) {
+                nram_acc[i] = 0.0f;
+            }
+
+            for (int ks = 0; ks < kernel_size_flat; ks += KERNEL_CHUNK) {
+                int k_len = (ks + KERNEL_CHUNK <= kernel_size_flat)
+                                ? KERNEL_CHUNK
+                                : (kernel_size_flat - ks);
+                int aligned_len = (k_len + 63) & ~63;
+
+                __memcpy(nram_kernel,
+                         kernel + oc * kernel_size_flat + ks,
+                         k_len * sizeof(float),
+                         GDRAM2NRAM);
+
+                for (int i_lo = 0; i_lo < lo_len; i_lo++) {
+                    int l_out = lo_start + i_lo;
+
+                    for (int i = 0; i < k_len; i++) {
+                        int kidx = ks + i;
+                        int ic_local = kidx / K;
+                        int k_idx = kidx % K;
+                        int in_pos = l_out * stride +
+                                     k_idx * dilation - padding;
+
+                        if (in_pos >= 0 && in_pos < L) {
+                            nram_patch[i] =
+                                x[n * Cin * L +
+                                  (ic_start + ic_local) * L +
+                                  in_pos];
+                        } else {
+                            nram_patch[i] = 0.0f;
+                        }
+                    }
+
+                    __bang_mul(nram_temp, nram_kernel, nram_patch,
+                               aligned_len);
+
+                    for (int i = 0; i < k_len; i++) {
+                        nram_acc[i_lo] += nram_temp[i];
+                    }
+                }
+            }
+
+            for (int i_lo = 0; i_lo < lo_len; i_lo++) {
+                output[n * Cout * Lout + oc * Lout +
+                       lo_start + i_lo] = nram_acc[i_lo];
+            }
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation,
+    int groups,
+    int bias)
+{
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "kernel must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    torch::Tensor kernel_fp32 = kernel;
+
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+    if (kernel_fp32.scalar_type() != torch::kFloat) {
+        kernel_fp32 = kernel.to(torch::kFloat);
+    }
+
+    int N = x_fp32.size(0);
+    int Cin = x_fp32.size(1);
+    int L = x_fp32.size(2);
+    int Cout = kernel_fp32.size(0);
+
+    int Lout = (L + 2 * padding - dilation * (kernel_size - 1) - 1)
+               / stride + 1;
+
+    auto output_fp32 = torch::empty({N, Cout, Lout},
+                                     x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    conv1d_standard_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, in_channels, L,
+        out_channels, kernel_size,
+        stride, padding, dilation,
+        groups, Lout);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
