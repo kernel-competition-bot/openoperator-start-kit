@@ -36,6 +36,11 @@ __mlu_entry__ void conv1d_standard_kernel(
     __nram__ float nram_temp[NRAM_TMP_MAX];
     __nram__ float nram_acc[OUT_CHUNK];
 
+    int k_offset[256];
+    for (int k = 0; k < K; k++) {
+        k_offset[k] = k * dilation - padding;
+    }
+
     for (int ni = 0; ni < n_count; ni++) {
         int n = n_start + ni;
 
@@ -110,7 +115,7 @@ __mlu_entry__ void conv1d_standard_kernel(
                                     for (int kk = k_start;
                                          kk < k_end && pi < k_len; kk++) {
                                         int in_pos = l_out * stride +
-                                                     kk * dilation - padding;
+                                                     k_offset[kk];
                                         if (in_pos >= 0 && in_pos < L &&
                                             lic >= 0 && lic < ic_tile_len) {
                                             nram_patch[pi] =
