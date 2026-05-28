@@ -1,0 +1,97 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define NRAM_BUF_SIZE 4096
+
+__mlu_entry__ void average_pooling_2d_kernel(
+    float *x,
+    float *output,
+    int N, int C, int H, int W,
+    int kernel_size, int H_out, int W_out)
+{
+    int total_elems = N * C * H_out * W_out;
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_elems / core_num;
+    uint32_t rem = total_elems % core_num;
+    uint32_t start = core_id * per_core
+                     + (core_id < rem ? core_id : rem);
+    uint32_t count = per_core + (core_id < rem ? 1 : 0);
+
+    float scale = 1.0f / (float)(kernel_size * kernel_size);
+
+    __nram__ float nram_row[NRAM_BUF_SIZE];
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        int tid = start + idx;
+
+        int wo = tid % W_out;
+        int tmp = tid / W_out;
+        int ho = tmp % H_out;
+        tmp /= H_out;
+        int c = tmp % C;
+        int n = tmp / C;
+
+        int base_offset = ((n * C + c) * H);
+        int h_start = ho * kernel_size;
+        int w_start = wo * kernel_size;
+
+        float sum = 0.0f;
+        for (int kh = 0; kh < kernel_size; kh++) {
+            int hi = h_start + kh;
+            int row_offset = (base_offset + hi) * W + w_start;
+            __memcpy(nram_row, x + row_offset,
+                     kernel_size * sizeof(float), GDRAM2NRAM);
+            for (int kw = 0; kw < kernel_size; kw++) {
+                sum += nram_row[kw];
+            }
+        }
+
+        output[tid] = sum * scale;
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int kernel_size)
+{
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int N = x_fp32.size(0);
+    int C = x_fp32.size(1);
+    int H = x_fp32.size(2);
+    int W = x_fp32.size(3);
+
+    int H_out = H / kernel_size;
+    int W_out = W / kernel_size;
+
+    auto output_fp32 = torch::empty({N, C, H_out, W_out},
+                                    x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    average_pooling_2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, C, H, W,
+        kernel_size, H_out, W_out);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
