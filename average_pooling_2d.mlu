@@ -85,7 +85,7 @@ torch::Tensor bang_func(
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t dim = {64, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     average_pooling_2d_kernel<<<dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
