@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define NRAM_BUF_SIZE 131072
+#define NRAM_BUF_SIZE 65536
 
 __mlu_entry__ void average_pooling_2d_kernel(
     float *x,
@@ -10,50 +10,63 @@ __mlu_entry__ void average_pooling_2d_kernel(
     int N, int C, int H, int W,
     int kernel_size, int H_out, int W_out)
 {
-    int total_elems = N * C * H_out * W_out;
+    int plane_size = H * W;
+    int out_plane_size = H_out * W_out;
+    int total_planes = N * C;
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total_elems / core_num;
-    uint32_t rem = total_elems % core_num;
-    uint32_t start = core_id * per_core
-                     + (core_id < rem ? core_id : rem);
-    uint32_t count = per_core + (core_id < rem ? 1 : 0);
-
-    if (taskId == 0) {
-        __bang_printf("taskDim=%d taskId=%d\n", taskDim, taskId);
-    }
+    // 按 (n,c) 平面拆分任务
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+    uint32_t per_task = total_planes / task_num;
+    uint32_t rem = total_planes % task_num;
+    uint32_t start = task_id * per_task
+                     + (task_id < rem ? task_id : rem);
+    uint32_t count = per_task + (task_id < rem ? 1 : 0);
 
     float scale = 1.0f / (float)(kernel_size * kernel_size);
 
-    __nram__ float nram_row[NRAM_BUF_SIZE];
+    // 双缓冲：buf_A 和 buf_B 交替作为当前计算缓冲和预取缓冲
+    __nram__ float buf_A[NRAM_BUF_SIZE];
+    __nram__ float buf_B[NRAM_BUF_SIZE];
 
-    for (uint32_t idx = 0; idx < count; idx++) {
-        int tid = start + idx;
+    for (uint32_t p_idx = 0; p_idx < count; p_idx++) {
+        int plane_idx = start + p_idx;
+        int n = plane_idx / C;
+        int c = plane_idx % C;
 
-        int wo = tid % W_out;
-        int tmp = tid / W_out;
-        int ho = tmp % H_out;
-        tmp /= H_out;
-        int c = tmp % C;
-        int n = tmp / C;
+        float *input_plane = x + plane_idx * plane_size;
+        float *output_plane = output + plane_idx * out_plane_size;
 
-        int base_offset = ((n * C + c) * H);
-        int h_start = ho * kernel_size;
-        int w_start = wo * kernel_size;
+        // 选择当前缓冲：偶数次用 buf_A，奇数次用 buf_B
+        float *cur_buf  = (p_idx % 2 == 0) ? buf_A : buf_B;
+        float *next_buf = (p_idx % 2 == 0) ? buf_B : buf_A;
 
-        float sum = 0.0f;
-        for (int kh = 0; kh < kernel_size; kh++) {
-            int hi = h_start + kh;
-            int row_offset = (base_offset + hi) * W + w_start;
-            __memcpy(nram_row, x + row_offset,
-                     kernel_size * sizeof(float), GDRAM2NRAM);
-            for (int kw = 0; kw < kernel_size; kw++) {
-                sum += nram_row[kw];
-            }
+        // 加载当前平面到 NRAM
+        __memcpy(cur_buf, input_plane,
+                 plane_size * sizeof(float), GDRAM2NRAM);
+
+        // 预取下一个平面到另一缓冲（为后续 __memcpy_async 预留框架）
+        // 当前串行执行，后续可替换为异步拷贝实现 load/compute 重叠
+        if (p_idx + 1 < count) {
+            __memcpy(next_buf, x + (start + p_idx + 1) * plane_size,
+                     plane_size * sizeof(float), GDRAM2NRAM);
         }
 
-        output[tid] = sum * scale;
+        // 从 NRAM 上的 cur_buf 计算该平面的所有输出位置
+        for (int ho = 0; ho < H_out; ho++) {
+            int h_start = ho * kernel_size;
+            for (int wo = 0; wo < W_out; wo++) {
+                int w_start = wo * kernel_size;
+                float sum = 0.0f;
+                for (int kh = 0; kh < kernel_size; kh++) {
+                    int row_base = (h_start + kh) * W;
+                    for (int kw = 0; kw < kernel_size; kw++) {
+                        sum += cur_buf[row_base + w_start + kw];
+                    }
+                }
+                output_plane[ho * W_out + wo] = sum * scale;
+            }
+        }
     }
 }
 
