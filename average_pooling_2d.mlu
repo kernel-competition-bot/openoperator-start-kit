@@ -20,6 +20,12 @@ __mlu_entry__ void average_pooling_2d_kernel(
                      + (core_id < rem ? core_id : rem);
     uint32_t count = per_core + (core_id < rem ? 1 : 0);
 
+    // 调试：将 taskDim 和 taskId 写入 output[0] 和 output[1]
+    if (taskId == 0) {
+        output[0] = (float)taskDim;
+        output[1] = (float)taskId;
+    }
+
     float scale = 1.0f / (float)(kernel_size * kernel_size);
 
     __nram__ float nram_row[NRAM_BUF_SIZE];
@@ -80,7 +86,7 @@ torch::Tensor bang_func(
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {2048, 1, 1};
+    cnrtDim3_t dim = {64, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     average_pooling_2d_kernel<<<dim, ktype, queue>>>(
