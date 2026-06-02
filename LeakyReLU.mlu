@@ -1,68 +1,53 @@
+// File: LeakyReLU.mlu
+// Description: BangC implementation of LeakyReLU activation for MLU.
+// Compile: This file is used as a source for MLU kernel compilation.
+
 #include <bang.h>
-#include <torch/extension.h>
-#include <cnrt.h>
+#include <mlu.h>
 
-#define CHUNK_SIZE 4096
-
-__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
-    // 多核拆分参数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total / core_num;
-    uint32_t remainder = total % core_num;
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
-
-    // NRAM 空间分配
-    __nram__ float nram_input[CHUNK_SIZE];
-    __nram__ float nram_relu[CHUNK_SIZE];
-    __nram__ float nram_temp[CHUNK_SIZE];
-
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
-        // Bang C 向量指令要求长度对齐到 64 个 float (256 字节)
-        uint32_t aligned_len = (len + 63) & ~63;
-
-        // 从 GDRAM 加载数据到 NRAM
-        __memcpy(nram_input, input + start + offset, len * sizeof(float), GDRAM2NRAM);
-
-        // 1. 计算 relu(x) = max(0, x)
-        __bang_active_relu(nram_relu, nram_input, aligned_len);
-
-        // 2. 计算 min(0, x) = x - relu(x)
-        __bang_sub(nram_temp, nram_input, nram_relu, aligned_len);
-
-        // 3. 计算 negative_slope * min(0, x)
-        __bang_mul_scalar(nram_temp, nram_temp, negative_slope, aligned_len);
-
-        // 4. 计算 leaky_relu(x) = relu(x) + negative_slope * min(0, x)
-        __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
-
-        // 写回 GDRAM（只写有效长度）
-        __memcpy(output + start + offset, nram_temp, len * sizeof(float), NRAM2GDRAM);
+// -----------------------------------------------------------------------------
+// Kernel: LeakyReLU forward on MLU (FP32)
+// -----------------------------------------------------------------------------
+__global__ void leaky_relu_kernel(float* output,
+                                  const float* input,
+                                  float negative_slope,
+                                  int64_t num_elements) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) {
+        float val = input[idx];
+        output[idx] = (val > 0.0f) ? val : val * negative_slope;
     }
 }
 
-torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
-    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+// -----------------------------------------------------------------------------
+// External wrapper function (must be named bang_func)
+// -----------------------------------------------------------------------------
+torch::Tensor bang_func(torch::Tensor x, double negative_slope) {
+    // Input validation
+    TORCH_CHECK(x.device().is_mlu(), "Input tensor must be on MLU device.");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input dtype must be float32.");
 
-    auto output = torch::empty_like(input);
-    int total = input.numel();
+    int64_t num_elements = x.numel();
+    torch::Tensor out = torch::empty_like(x);
 
-    // 获取 MLU 队列
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    float* input_ptr = x.data_ptr<float>();
+    float* output_ptr = out.data_ptr<float>();
+    float slope_f = static_cast<float>(negative_slope);
 
-    // 配置任务维度（使用 4 个 core）
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    // Get the current MLU stream's queue (do NOT create a new queue)
+    auto queue = torch_mlu::getCurMLUStream().queue();
 
-    // 启动 kernel
-    leakyrelu_kernel<<<dim, ktype, queue>>>(
-        input.data_ptr<float>(),
-        output.data_ptr<float>(),
-        total,
-        negative_slope
-    );
+    const int block_size = 256;
+    int grid_size = (num_elements + block_size - 1) / block_size;
 
-    return output;
+    // Launch kernel
+    MLU_CHECK(mluLaunchKernel((void*)leaky_relu_kernel,
+                              grid_size, block_size,
+                              nullptr, queue,
+                              output_ptr, input_ptr, slope_f, num_elements));
+
+    // Synchronize to ensure completion
+    mluQueueSync(queue);
+
+    return out;
 }
