@@ -1,0 +1,111 @@
+// LogSoftmax.cpp
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+// MLU kernel: LogSoftmax along dim=1
+__mlu_entry__ void logsoftmax_kernel(
+    float *input,
+    float *output,
+    int batch_size,
+    int dim_size) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    // Distribute rows across cores
+    uint32_t rows_per_core = batch_size / core_num;
+    uint32_t row_remainder = batch_size % core_num;
+    uint32_t start_row = core_id * rows_per_core +
+                     (core_id < row_remainder ? core_id : row_remainder);
+    uint32_t my_rows = rows_per_core +
+                   (core_id < row_remainder ? 1 : 0);
+
+    __nram__ float nram_buf[CHUNK_SIZE];
+
+    for (uint32_t r = 0; r < my_rows; r++) {
+        uint32_t row_idx = start_row + r;
+        float *row_input = input + row_idx * dim_size;
+        float *row_output = output + row_idx * dim_size;
+
+        // --- Pass 1: find row max ---
+        float row_max = -3e38f;
+        for (uint32_t offset = 0; offset < dim_size; offset += CHUNK_SIZE) {
+            uint32_t len = (offset + CHUNK_SIZE <= dim_size) ? CHUNK_SIZE : (dim_size - offset);
+            uint32_t aligned_len = (len + 63) & ~63;
+
+            __memcpy(nram_buf, row_input + offset,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (uint32_t i = 0; i < len; i++) {
+                float v = nram_buf[i];
+                row_max = (v > row_max) ? v : row_max;
+            }
+        }
+
+        // --- Pass 2: sum of exp(x - max) ---
+        float row_sum = 0.0f;
+        for (uint32_t offset = 0; offset < dim_size; offset += CHUNK_SIZE) {
+            uint32_t len = (offset + CHUNK_SIZE <= dim_size) ? CHUNK_SIZE : (dim_size - offset);
+            uint32_t aligned_len = (len + 63) & ~63;
+
+            __memcpy(nram_buf, row_input + offset,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            // exp(x - max) and accumulate
+            for (uint32_t i = 0; i < len; i++) {
+                row_sum += expf(nram_buf[i] - row_max);
+            }
+        }
+        float log_sum = logf(row_sum);
+
+        // --- Pass 3: final result = x - max - log(sum(exp(x-max))) ---
+        for (uint32_t offset = 0; offset < dim_size; offset += CHUNK_SIZE) {
+            uint32_t len = (offset + CHUNK_SIZE <= dim_size) ? CHUNK_SIZE : (dim_size - offset);
+
+            __memcpy(nram_buf, row_input + offset,
+                     len * sizeof(float), GDRAM2NRAM);
+
+            for (uint32_t i = 0; i < len; i++) {
+                nram_buf[i] = nram_buf[i] - row_max - log_sum;
+            }
+
+            __memcpy(row_output + offset, nram_buf,
+                     len * sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+// C++ wrapper called by PyTorch
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(input_fp32);
+    int batch_size = input_fp32.size(0);
+    int dim_size = input_fp32.size(1);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    logsoftmax_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch_size,
+        dim_size
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}

@@ -1,0 +1,130 @@
+// batched_matrix_multiplication.cpp
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 64
+
+// MLU kernel: batched matrix multiplication C = A @ B
+//   A: [batch_size, M, K], B: [batch_size, K, N], C: [batch_size, M, N]
+//   NRAM-tiled: loads A[TILE_M][TILE_K], B[TILE_K][TILE_N] tiles,
+//   accumulates into C[TILE_M][TILE_N], then writes back.
+__mlu_entry__ void batched_matmul_kernel(
+    float *A,
+    float *B,
+    float *C,
+    int batch_size,
+    int M,
+    int K,
+    int N) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    // Distribute batches across cores
+    uint32_t batches_per_core = batch_size / core_num;
+    uint32_t batch_rem = batch_size % core_num;
+    uint32_t start_batch = core_id * batches_per_core +
+                           (core_id < batch_rem ? core_id : batch_rem);
+    uint32_t my_batches = batches_per_core +
+                          (core_id < batch_rem ? 1 : 0);
+
+    // NRAM tile buffers: 3 * 64*64 * 4 bytes = 48 KB
+    __nram__ float nram_A[TILE_M][TILE_K];
+    __nram__ float nram_B[TILE_K][TILE_N];
+    __nram__ float nram_C[TILE_M][TILE_N];
+
+    for (uint32_t b = 0; b < my_batches; b++) {
+        uint32_t batch = start_batch + b;
+        float *batch_A = A + batch * M * K;
+        float *batch_B = B + batch * K * N;
+        float *batch_C = C + batch * M * N;
+
+        // Iterate over output tiles
+        for (uint32_t m_off = 0; m_off < M; m_off += TILE_M) {
+            uint32_t m_tile = (m_off + TILE_M <= M) ? TILE_M : (M - m_off);
+            for (uint32_t n_off = 0; n_off < N; n_off += TILE_N) {
+                uint32_t n_tile = (n_off + TILE_N <= N) ? TILE_N : (N - n_off);
+
+                // Zero-initialize C accumulation tile
+                for (uint32_t i = 0; i < m_tile; i++)
+                    for (uint32_t j = 0; j < n_tile; j++)
+                        nram_C[i][j] = 0.0f;
+
+                // Accumulate over K dimension (inner product loop)
+                for (uint32_t k_off = 0; k_off < K; k_off += TILE_K) {
+                    uint32_t k_tile = (k_off + TILE_K <= K) ? TILE_K : (K - k_off);
+
+                    // Load A tile [m_tile x k_tile] row by row
+                    for (uint32_t i = 0; i < m_tile; i++)
+                        __memcpy(nram_A[i],
+                                 batch_A + (m_off + i) * K + k_off,
+                                 k_tile * sizeof(float), GDRAM2NRAM);
+
+                    // Load B tile [k_tile x n_tile] row by row
+                    for (uint32_t i = 0; i < k_tile; i++)
+                        __memcpy(nram_B[i],
+                                 batch_B + (k_off + i) * N + n_off,
+                                 n_tile * sizeof(float), GDRAM2NRAM);
+
+                    // C += A @ B  (triple-nested loop on NRAM)
+                    for (uint32_t i = 0; i < m_tile; i++)
+                        for (uint32_t j = 0; j < n_tile; j++)
+                            for (uint32_t kk = 0; kk < k_tile; kk++)
+                                nram_C[i][j] += nram_A[i][kk] * nram_B[kk][j];
+                }
+
+                // Write C tile back to GDRAM
+                for (uint32_t i = 0; i < m_tile; i++)
+                    __memcpy(batch_C + (m_off + i) * N + n_off,
+                             nram_C[i],
+                             n_tile * sizeof(float), NRAM2GDRAM);
+            }
+        }
+    }
+}
+
+// C++ wrapper called by PyTorch
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+
+    // Preserve original data type
+    auto original_dtype = A.scalar_type();
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+        B_fp32 = B.to(torch::kFloat);
+    }
+
+    int batch_size = A_fp32.size(0);
+    int M = A_fp32.size(1);
+    int K = A_fp32.size(2);
+    int N = B_fp32.size(2);
+
+    // Output shape is [batch_size, M, N], different from both inputs
+    auto C_fp32 = torch::empty({batch_size, M, N}, A_fp32.options());
+
+    // Get current MLU stream (do not create new queue)
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // Launch configuration: 4 cores, union1 task type
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    batched_matmul_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(),
+        batch_size, M, K, N
+    );
+
+    // Convert back to original data type if needed
+    if (original_dtype != torch::kFloat) {
+        return C_fp32.to(original_dtype);
+    }
+    return C_fp32;
+}
