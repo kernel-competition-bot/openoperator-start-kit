@@ -104,7 +104,7 @@ torch::Tensor bang_func(
 
     cnrtDim3_t dim = {CORE_NUM, 1, 1};
     cnrtFunctionType_t ktype =
-        cnrtFuncTypeUnion1;
+        cnrtFuncTypeBlock;
 
     mse_kernel<<<dim, ktype, queue>>>(
         pred_fp32.data_ptr<float>(),
