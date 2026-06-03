@@ -1,28 +1,32 @@
-// File: LeakyReLU.mlu
-// Description: BangC implementation of LeakyReLU activation for MLU.
+// File: matrix_scalar_multiplication.mlu
+// Description: BangC implementation of matrix-scalar multiplication for MLU.
 // Compile: This file is used as a source for MLU kernel compilation.
 //
 // Optimization notes:
 //   - NRAM tiling: each thread loads a contiguous tile of TILE_SIZE elements
-//     into on-chip NRAM, computes LeakyReLU, then writes back to GDRAM.
+//     into on-chip NRAM, multiplies by scalar, then writes back to GDRAM.
 //     This avoids repeated high-latency GDRAM access and maximizes bandwidth.
-//   - Removed mluQueueSync: PyTorch handles synchronization when the tensor
-//     is consumed, so explicit sync only stalls the pipeline.
+//   - Uses __bang_mul_scalar for vectorized scalar multiplication on NRAM.
+//   - No explicit sync: PyTorch handles synchronization when the tensor is consumed.
 
 #include <bang.h>
 #include <mlu.h>
 
 // Each thread loads up to TILE_SIZE floats into NRAM per iteration.
-// 16384 * 4 bytes = 64 KB of NRAM, well within the typical per-core NRAM budget.
+// 16384 * 4 bytes = 64 KB, well within the typical per-core NRAM budget.
 #define TILE_SIZE 16384
 
 // -----------------------------------------------------------------------------
-// Kernel: LeakyReLU forward on MLU (FP32) with NRAM tiling
+// Kernel: Matrix-scalar multiplication on MLU (FP32) with NRAM tiling
+//   C[i] = A[i] * s
+//
+// For 256M-element matrices (~1GB), the NRAM-tiled approach is essential:
+// without tiling, every element access hits high-latency GDRAM directly.
 // -----------------------------------------------------------------------------
-__global__ void leaky_relu_kernel(float* output,
-                                  const float* input,
-                                  float negative_slope,
-                                  int64_t num_elements) {
+__global__ void matrix_scalar_mul_kernel(float* output,
+                                         const float* input,
+                                         float scalar,
+                                         int64_t num_elements) {
     int64_t tile_id = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total_threads = gridDim.x * blockDim.x;
     int64_t num_tiles = (num_elements + TILE_SIZE - 1) / TILE_SIZE;
@@ -40,11 +44,8 @@ __global__ void leaky_relu_kernel(float* output,
         __memcpy(nram_buf, input + offset,
                  tile_elems * sizeof(float), GDRAM2NRAM);
 
-        // LeakyReLU: out = in > 0 ? in : in * negative_slope
-        for (int i = 0; i < tile_elems; i++) {
-            float val = nram_buf[i];
-            nram_buf[i] = (val > 0.0f) ? val : (val * negative_slope);
-        }
+        // Multiply each element by scalar (BANG vector intrinsic)
+        __bang_mul_scalar(nram_buf, nram_buf, scalar, tile_elems);
 
         // Write tile back to GDRAM
         __memcpy(output + offset, nram_buf,
@@ -54,36 +55,39 @@ __global__ void leaky_relu_kernel(float* output,
 
 // -----------------------------------------------------------------------------
 // External wrapper function (must be named bang_func)
+// Signature matches Model.forward(A, s) from the Python reference:
+//   A: input tensor of shape (M, N), float32 on MLU
+//   s: scalar multiplier (float)
+// Returns: output tensor of same shape, A * s element-wise
 // -----------------------------------------------------------------------------
-torch::Tensor bang_func(torch::Tensor x, double negative_slope) {
+torch::Tensor bang_func(torch::Tensor A, double s) {
     // Input validation
-    TORCH_CHECK(x.device().is_mlu(), "Input tensor must be on MLU device.");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat32,
+    TORCH_CHECK(A.device().is_mlu(), "Input tensor must be on MLU device.");
+    TORCH_CHECK(A.scalar_type() == torch::kFloat32,
                 "Input dtype must be float32.");
 
-    int64_t num_elements = x.numel();
-    torch::Tensor out = torch::empty_like(x);
+    int64_t num_elements = A.numel();
+    torch::Tensor out = torch::empty_like(A);
 
-    float* input_ptr = x.data_ptr<float>();
+    float* input_ptr = A.data_ptr<float>();
     float* output_ptr = out.data_ptr<float>();
-    float slope_f = static_cast<float>(negative_slope);
+    float scalar = static_cast<float>(s);
 
-    // Get the current MLU stream's queue (do NOT create a new queue)
+    // Get the current MLU stream queue (reuse, do not create new)
     auto queue = torch_mlu::getCurMLUStream().queue();
 
-    // Use enough threads to keep all cores busy.
-    // target_blocks: aim for high occupancy; 128 blocks * 256 threads = 32768 threads
+    // Aim for high occupancy; cap grid_size to avoid over-subscription
     const int block_size = 256;
     int target_blocks = 128;
     int num_tiles = (int)((num_elements + TILE_SIZE - 1) / TILE_SIZE);
     int grid_size = (num_tiles < target_blocks) ? num_tiles : target_blocks;
 
     // Launch kernel
-    MLU_CHECK(mluLaunchKernel((void*)leaky_relu_kernel,
+    MLU_CHECK(mluLaunchKernel((void*)matrix_scalar_mul_kernel,
                               grid_size, block_size,
                               nullptr, queue,
-                              output_ptr, input_ptr, slope_f, num_elements));
+                              output_ptr, input_ptr, scalar, num_elements));
 
-    // No explicit sync — PyTorch will synchronize when consuming the output
+    // No explicit sync — PyTorch will synchronize when consuming the output tensor
     return out;
 }
