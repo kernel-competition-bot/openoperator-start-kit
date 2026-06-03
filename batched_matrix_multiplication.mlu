@@ -1,4 +1,4 @@
-// batched_matrix_multiplication.cpp
+// 004_batched_matrix_multiplication.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>

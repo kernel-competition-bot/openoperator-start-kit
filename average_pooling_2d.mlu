@@ -1,0 +1,127 @@
+// average_pooling_2d.cpp
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+// Problem-specific constants: kernel_size=11, stride=11, width=2048
+// Input: [batch, channels=64, height=2048, width=2048]
+// Output: [batch, channels, 186, 186]  ( (2048-11)/11 + 1 = 186 )
+#define MAX_WIDTH 2048
+#define MAX_KERNEL 16
+
+// MLU kernel: 2D average pooling (non-overlapping windows, stride == kernel_size)
+//
+// Strategy: since stride == kernel_size, each input element belongs to exactly
+// one output window. For each output row group, load all kernel_size input rows
+// into NRAM (kernel_size * MAX_WIDTH floats = 88 KB at kernel=11), then scan
+// horizontally with a sliding kernel_size window and write outputs directly.
+__mlu_entry__ void avgpool2d_kernel(
+    float *input,
+    float *output,
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    int kernel_size,
+    int stride,
+    int out_h,
+    int out_w) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    // Distribute batches across cores
+    uint32_t batches_per_core = batch_size / core_num;
+    uint32_t batch_rem = batch_size % core_num;
+    uint32_t start_batch = core_id * batches_per_core +
+                           (core_id < batch_rem ? core_id : batch_rem);
+    uint32_t my_batches = batches_per_core +
+                          (core_id < batch_rem ? 1 : 0);
+
+    // NRAM buffer: kernel_size rows * width floats each
+    // At kernel_size=11, width=2048: 11 * 2048 * 4 = 88 KB
+    __nram__ float nram_rows[MAX_KERNEL][MAX_WIDTH];
+
+    // Precompute reciprocal for multiply instead of divide
+    float inv_win = 1.0f / (float)(kernel_size * kernel_size);
+
+    for (uint32_t b = 0; b < my_batches; b++) {
+        uint32_t batch = start_batch + b;
+
+        for (uint32_t c = 0; c < channels; c++) {
+            float *ch_input = input +
+                (batch * channels + c) * height * width;
+            float *ch_output = output +
+                (batch * channels + c) * out_h * out_w;
+
+            // Process one output row at a time
+            for (uint32_t oh = 0; oh < out_h; oh++) {
+                // Load all kernel_size rows for current output row
+                for (uint32_t kh = 0; kh < kernel_size; kh++) {
+                    __memcpy(nram_rows[kh],
+                             ch_input + (oh * stride + kh) * width,
+                             width * sizeof(float), GDRAM2NRAM);
+                }
+
+                // Compute each output column: sum over kernel_size x kernel_size window
+                for (uint32_t ow = 0; ow < out_w; ow++) {
+                    float sum = 0.0f;
+                    uint32_t col_start = ow * stride;
+
+                    for (uint32_t kh = 0; kh < kernel_size; kh++) {
+                        for (uint32_t kw = 0; kw < kernel_size; kw++) {
+                            sum += nram_rows[kh][col_start + kw];
+                        }
+                    }
+
+                    ch_output[oh * out_w + ow] = sum * inv_win;
+                }
+            }
+        }
+    }
+}
+
+// C++ wrapper called by PyTorch
+torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    // Preserve original data type
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch_size = input_fp32.size(0);
+    int channels = input_fp32.size(1);
+    int height = input_fp32.size(2);
+    int width = input_fp32.size(3);
+
+    // stride defaults to kernel_size, padding defaults to 0
+    int stride = kernel_size;
+    int out_h = (height - kernel_size) / stride + 1;
+    int out_w = (width - kernel_size) / stride + 1;
+
+    auto output_fp32 = torch::empty(
+        {batch_size, channels, out_h, out_w}, input_fp32.options());
+
+    // Get current MLU stream (do not create new queue)
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // Launch configuration: 4 cores, union1 task type
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    avgpool2d_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch_size, channels, height, width,
+        kernel_size, stride, out_h, out_w
+    );
+
+    // Convert back to original data type if needed
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}
