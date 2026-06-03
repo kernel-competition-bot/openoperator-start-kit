@@ -1,0 +1,102 @@
+#include <bang.h>
+#include <float.h>                     // 提供 FLT_MAX
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+#define CORE_NUM 4                     // MLU370 常用核心数，可根据实际调整
+
+__mlu_entry__ void argmax_kernel(
+    float *input,
+    int64_t *output,
+    int reduce_size,
+    int inner_size,
+    int total_outputs) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_outputs / core_num;
+    uint32_t remainder = total_outputs % core_num;
+
+    uint32_t start_idx = core_id * per_core +
+                         (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t output_idx = start_idx + i;
+        uint32_t outer_idx = output_idx / inner_size;
+        uint32_t inner_idx = output_idx % inner_size;
+
+        // 第 outer_idx 个 outer 块中的起始偏移（单位：float）
+        uint32_t base_offset = (outer_idx * reduce_size * inner_size + inner_idx);
+        int stride = inner_size;          // 步长（元素个数）
+
+        float best_val = -FLT_MAX;
+        int64_t best_idx = 0;
+
+        // 线性扫描规约维度
+        for (int k = 0; k < reduce_size; ++k) {
+            float val = input[base_offset + k * stride];
+            if (val > best_val) {
+                best_val = val;
+                best_idx = k;
+            }
+        }
+        output[output_idx] = best_idx;
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int64_t dim) {
+
+    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
+
+    // 确保输入为 float 类型
+    torch::Tensor x_fp32 = x;
+    if (x.scalar_type() != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    // 输出形状：去掉 dim 维度
+    auto sizes = x_fp32.sizes().vec();
+    sizes.erase(sizes.begin() + dim);
+    auto output = torch::empty(
+        sizes,
+        torch::TensorOptions()
+            .dtype(torch::kLong)        // int64
+            .device(x_fp32.device()));
+
+    // 计算 outer_size, reduce_size, inner_size
+    int64_t reduce_size = x_fp32.size(dim);
+    int64_t inner_size = 1;
+    for (size_t i = dim + 1; i < (size_t)x_fp32.dim(); ++i) {
+        inner_size *= x_fp32.size(i);
+    }
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= x_fp32.size(i);
+    }
+    int64_t total_outputs = outer_size * inner_size;
+    TORCH_CHECK(total_outputs == output.numel(), "Output size mismatch");
+
+    // 获取 MLU 队列并启动 kernel
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim_grid = {CORE_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    argmax_kernel<<<dim_grid, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output.data_ptr<int64_t>(),
+        reduce_size,
+        inner_size,
+        total_outputs);
+
+    return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "Argmax over a dimension");
+}
