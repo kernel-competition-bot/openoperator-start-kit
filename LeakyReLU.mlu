@@ -1,89 +1,92 @@
-// File: LeakyReLU.mlu
-// Description: BangC implementation of LeakyReLU activation for MLU.
-// Compile: This file is used as a source for MLU kernel compilation.
-//
-// Optimization notes:
-//   - NRAM tiling: each thread loads a contiguous tile of TILE_SIZE elements
-//     into on-chip NRAM, computes LeakyReLU, then writes back to GDRAM.
-//     This avoids repeated high-latency GDRAM access and maximizes bandwidth.
-//   - Removed mluQueueSync: PyTorch handles synchronization when the tensor
-//     is consumed, so explicit sync only stalls the pipeline.
-
+// 001_LeakyReLU.cpp
 #include <bang.h>
-#include <mlu.h>
+#include <torch/extension.h>
+#include <cnrt.h>
 
-// Each thread loads up to TILE_SIZE floats into NRAM per iteration.
-// 16384 * 4 bytes = 64 KB of NRAM, well within the typical per-core NRAM budget.
-#define TILE_SIZE 16384
+#define CHUNK_SIZE 4096
 
-// -----------------------------------------------------------------------------
-// Kernel: LeakyReLU forward on MLU (FP32) with NRAM tiling
-// -----------------------------------------------------------------------------
-__global__ void leaky_relu_kernel(float* output,
-                                  const float* input,
-                                  float negative_slope,
-                                  int64_t num_elements) {
-    int64_t tile_id = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total_threads = gridDim.x * blockDim.x;
-    int64_t num_tiles = (num_elements + TILE_SIZE - 1) / TILE_SIZE;
+// MLU kernel: LeakyReLU activation
+__mlu_entry__ void leakyrelu_kernel(
+    float *input,
+    float *output,
+    int total,
+    float negative_slope) {
 
-    __nram__ float nram_buf[TILE_SIZE];
+    // Core ID and total cores
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
 
-    // Each thread processes tiles in a strided round-robin fashion
-    for (int64_t t = tile_id; t < num_tiles; t += total_threads) {
-        int64_t offset = t * TILE_SIZE;
-        int tile_elems = (offset + TILE_SIZE <= num_elements)
-                         ? TILE_SIZE
-                         : (int)(num_elements - offset);
+    // Partition workload
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
 
-        // Load tile from GDRAM into NRAM
-        __memcpy(nram_buf, input + offset,
-                 tile_elems * sizeof(float), GDRAM2NRAM);
+    // NRAM buffers
+    __nram__ float nram_input[CHUNK_SIZE];
+    __nram__ float nram_relu[CHUNK_SIZE];
+    __nram__ float nram_temp[CHUNK_SIZE];
 
-        // LeakyReLU: out = in > 0 ? in : in * negative_slope
-        for (int i = 0; i < tile_elems; i++) {
-            float val = nram_buf[i];
-            nram_buf[i] = (val > 0.0f) ? val : (val * negative_slope);
-        }
+    // Process chunks
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+        uint32_t aligned_len = (len + 63) & ~63;   // 64‑byte alignment
 
-        // Write tile back to GDRAM
-        __memcpy(output + offset, nram_buf,
-                 tile_elems * sizeof(float), NRAM2GDRAM);
+        // Load input from GDRAM to NRAM
+        __memcpy(nram_input, input + start + offset,
+                 len * sizeof(float), GDRAM2NRAM);
+
+        // Compute ReLU(x)
+        __bang_active_relu(nram_relu, nram_input, aligned_len);
+
+        // Compute min(0, x) = x - ReLU(x)
+        __bang_sub(nram_temp, nram_input, nram_relu, aligned_len);
+
+        // Scale negative part: negative_slope * min(0,x)
+        __bang_mul_scalar(nram_temp, nram_temp, negative_slope, aligned_len);
+
+        // Add positive part: ReLU(x) + scaled_negative
+        __bang_add(nram_temp, nram_relu, nram_temp, aligned_len);
+
+        // Store result back to GDRAM
+        __memcpy(output + start + offset, nram_temp,
+                 len * sizeof(float), NRAM2GDRAM);
     }
 }
 
-// -----------------------------------------------------------------------------
-// External wrapper function (must be named bang_func)
-// -----------------------------------------------------------------------------
-torch::Tensor bang_func(torch::Tensor x, double negative_slope) {
-    // Input validation
-    TORCH_CHECK(x.device().is_mlu(), "Input tensor must be on MLU device.");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat32,
-                "Input dtype must be float32.");
+// C++ wrapper called by PyTorch
+torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
 
-    int64_t num_elements = x.numel();
-    torch::Tensor out = torch::empty_like(x);
+    // Preserve original data type
+    auto original_dtype = input.scalar_type();
+    torch::Tensor input_fp32 = input;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
+    }
 
-    float* input_ptr = x.data_ptr<float>();
-    float* output_ptr = out.data_ptr<float>();
-    float slope_f = static_cast<float>(negative_slope);
+    auto output_fp32 = torch::empty_like(input_fp32);
+    int total = input_fp32.numel();
 
-    // Get the current MLU stream's queue (do NOT create a new queue)
-    auto queue = torch_mlu::getCurMLUStream().queue();
+    // Get current MLU stream (do not create new queue)
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // Use enough threads to keep all cores busy.
-    // target_blocks: aim for high occupancy; 128 blocks * 256 threads = 32768 threads
-    const int block_size = 256;
-    int target_blocks = 128;
-    int num_tiles = (int)((num_elements + TILE_SIZE - 1) / TILE_SIZE);
-    int grid_size = (num_tiles < target_blocks) ? num_tiles : target_blocks;
+    // Launch configuration: 4 cores, union1 task type
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // Launch kernel
-    MLU_CHECK(mluLaunchKernel((void*)leaky_relu_kernel,
-                              grid_size, block_size,
-                              nullptr, queue,
-                              output_ptr, input_ptr, slope_f, num_elements));
+    leakyrelu_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total,
+        static_cast<float>(negative_slope)
+    );
 
-    // No explicit sync — PyTorch will synchronize when consuming the output
-    return out;
+    // Convert back to original data type if needed
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
 }
