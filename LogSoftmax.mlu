@@ -1,4 +1,4 @@
-// 003_LogSoftmax.cpp
+// LogSoftmax.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
@@ -77,8 +77,12 @@ __mlu_entry__ void logsoftmax_kernel(
 }
 
 // C++ wrapper called by PyTorch
-torch::Tensor bang_func(torch::Tensor x) {
+torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    // dim=1 is softmax along the feature axis (each row independently);
+    // dim=-1 is equivalent for 2D input.
+    TORCH_CHECK(dim == 1 || dim == -1,
+                "LogSoftmax: only dim=1 is supported, got dim=", dim);
 
     auto original_dtype = x.scalar_type();
     torch::Tensor input_fp32 = x;
@@ -92,10 +96,10 @@ torch::Tensor bang_func(torch::Tensor x) {
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t cnrt_dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    logsoftmax_kernel<<<dim, ktype, queue>>>(
+    logsoftmax_kernel<<<cnrt_dim, ktype, queue>>>(
         input_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         batch_size,

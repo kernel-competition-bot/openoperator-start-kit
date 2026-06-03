@@ -1,16 +1,19 @@
-// 004_batched_matrix_multiplication.cpp
+// batched_matrix_multiplication.cpp
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
+// Tile sizes tuned for [512, 1024] x [1024, 2048]:
+//   TILE_N is made large (256) to exploit wide rows of B (8 KB per row),
+//   reducing __memcpy call count 4x versus square 64x64x64 tiles.
+//   Total NRAM: 64*64 + 64*256 + 64*256 = 36K floats = 144 KB.
 #define TILE_M 64
-#define TILE_N 64
+#define TILE_N 256
 #define TILE_K 64
 
 // MLU kernel: batched matrix multiplication C = A @ B
-//   A: [batch_size, M, K], B: [batch_size, K, N], C: [batch_size, M, N]
-//   NRAM-tiled: loads A[TILE_M][TILE_K], B[TILE_K][TILE_N] tiles,
-//   accumulates into C[TILE_M][TILE_N], then writes back.
+//   ikj loop order: broadcast aik into the innermost loop over j,
+//   enabling the compiler to pipeline scalar multiply-add on NRAM.
 __mlu_entry__ void batched_matmul_kernel(
     float *A,
     float *B,
@@ -31,7 +34,7 @@ __mlu_entry__ void batched_matmul_kernel(
     uint32_t my_batches = batches_per_core +
                           (core_id < batch_rem ? 1 : 0);
 
-    // NRAM tile buffers: 3 * 64*64 * 4 bytes = 48 KB
+    // NRAM tile buffers: A[64x64] + B[64x256] + C[64x256]
     __nram__ float nram_A[TILE_M][TILE_K];
     __nram__ float nram_B[TILE_K][TILE_N];
     __nram__ float nram_C[TILE_M][TILE_N];
@@ -42,38 +45,57 @@ __mlu_entry__ void batched_matmul_kernel(
         float *batch_B = B + batch * K * N;
         float *batch_C = C + batch * M * N;
 
-        // Iterate over output tiles
         for (uint32_t m_off = 0; m_off < M; m_off += TILE_M) {
             uint32_t m_tile = (m_off + TILE_M <= M) ? TILE_M : (M - m_off);
             for (uint32_t n_off = 0; n_off < N; n_off += TILE_N) {
                 uint32_t n_tile = (n_off + TILE_N <= N) ? TILE_N : (N - n_off);
 
-                // Zero-initialize C accumulation tile
-                for (uint32_t i = 0; i < m_tile; i++)
-                    for (uint32_t j = 0; j < n_tile; j++)
-                        nram_C[i][j] = 0.0f;
-
-                // Accumulate over K dimension (inner product loop)
-                for (uint32_t k_off = 0; k_off < K; k_off += TILE_K) {
+                // First k-tile: load and compute into C directly (avoid zero-init)
+                uint32_t k_off = 0;
+                {
                     uint32_t k_tile = (k_off + TILE_K <= K) ? TILE_K : (K - k_off);
 
-                    // Load A tile [m_tile x k_tile] row by row
                     for (uint32_t i = 0; i < m_tile; i++)
                         __memcpy(nram_A[i],
                                  batch_A + (m_off + i) * K + k_off,
                                  k_tile * sizeof(float), GDRAM2NRAM);
 
-                    // Load B tile [k_tile x n_tile] row by row
-                    for (uint32_t i = 0; i < k_tile; i++)
-                        __memcpy(nram_B[i],
-                                 batch_B + (k_off + i) * N + n_off,
+                    for (uint32_t kk = 0; kk < k_tile; kk++)
+                        __memcpy(nram_B[kk],
+                                 batch_B + (k_off + kk) * N + n_off,
                                  n_tile * sizeof(float), GDRAM2NRAM);
 
-                    // C += A @ B  (triple-nested loop on NRAM)
+                    // C = A @ B  (first tile, no prior accumulation needed)
                     for (uint32_t i = 0; i < m_tile; i++)
-                        for (uint32_t j = 0; j < n_tile; j++)
+                        for (uint32_t j = 0; j < n_tile; j++) {
+                            float sum = 0.0f;
                             for (uint32_t kk = 0; kk < k_tile; kk++)
-                                nram_C[i][j] += nram_A[i][kk] * nram_B[kk][j];
+                                sum += nram_A[i][kk] * nram_B[kk][j];
+                            nram_C[i][j] = sum;
+                        }
+                }
+
+                // Remaining k-tiles: accumulate into C
+                for (k_off = TILE_K; k_off < K; k_off += TILE_K) {
+                    uint32_t k_tile = (k_off + TILE_K <= K) ? TILE_K : (K - k_off);
+
+                    for (uint32_t i = 0; i < m_tile; i++)
+                        __memcpy(nram_A[i],
+                                 batch_A + (m_off + i) * K + k_off,
+                                 k_tile * sizeof(float), GDRAM2NRAM);
+
+                    for (uint32_t kk = 0; kk < k_tile; kk++)
+                        __memcpy(nram_B[kk],
+                                 batch_B + (k_off + kk) * N + n_off,
+                                 n_tile * sizeof(float), GDRAM2NRAM);
+
+                    // C += A @ B  (ikj order: broadcast aik)
+                    for (uint32_t i = 0; i < m_tile; i++)
+                        for (uint32_t kk = 0; kk < k_tile; kk++) {
+                            float aik = nram_A[i][kk];
+                            for (uint32_t j = 0; j < n_tile; j++)
+                                nram_C[i][j] += aik * nram_B[kk][j];
+                        }
                 }
 
                 // Write C tile back to GDRAM
