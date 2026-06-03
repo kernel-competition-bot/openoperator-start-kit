@@ -2,7 +2,7 @@
 
 赛事官网->https://openoperator.cn
 
-快捷监控->http://152.136.18.42:13000
+快捷监控->http://43.143.241.66:13000
 
 此仓库是openoperator赛事举办方提供的模板仓库。选手可以直接Fork此仓库作为自己队伍的仓库。
 
@@ -10,7 +10,7 @@
 
 1. Fork此仓库，将仓库可见范围设置为private，将bot帐号加入collaborators
 2. 点击`settings`->`webhooks`->`Add webhook`，配置webhook
-   1. `Payload URL`填写`http://152.136.18.42:8000/webhook`
+   1. `Payload URL`填写`http://43.143.241.66:8000/webhook`
    2. `Content type`选择`application/json`
    3. `Secret`填写分配到的密钥（参赛信息收集完成后会分发随机的`webhook secret`）
    4. `SSL verification`选择`Disable`
