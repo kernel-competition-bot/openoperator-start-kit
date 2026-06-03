@@ -169,7 +169,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
         module = load(
             name=f"bang_{stem}",
             sources=[str(wrapper_path)],
-            extra_objects=[str(obj_path)],
+            extra_ldflags=[str(obj_path)],
             verbose=False,
         )
     finally:
