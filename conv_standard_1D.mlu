@@ -1,0 +1,139 @@
+// conv_standard_1D.cpp
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+// Problem: 1D convolution, stride=1, padding=0, dilation=1, groups=1
+// Input: [B, C_in, L] = [16, 3, 512]
+// Kernel: [C_out, C_in, K] = [64, 3, 3]
+// Output: [B, C_out, L_out] = [16, 64, 510]  (L_out = L - K + 1 = 510)
+//
+// Strategy: process output channels in groups of N_OC to keep NRAM small.
+// For each (batch, oc_group):
+//   - zero output accumulator in NRAM
+//   - for each input channel: load full input row, convolve with kernel rows
+//   - write accumulator back to GDRAM
+#define N_OC       16      // output channels per tile
+#define MAX_L      512     // max input length
+#define MAX_L_OUT  510     // max output length (L - K + 1)
+
+__mlu_entry__ void conv1d_kernel(
+    float *input,
+    float *kernel,
+    float *output,
+    int batch_size,
+    int in_channels,
+    int out_channels,
+    int L,
+    int K,
+    int L_out) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    // Distribute batches across cores
+    uint32_t batches_per_core = batch_size / core_num;
+    uint32_t batch_rem = batch_size % core_num;
+    uint32_t start_batch = core_id * batches_per_core +
+                           (core_id < batch_rem ? core_id : batch_rem);
+    uint32_t my_batches = batches_per_core +
+                          (core_id < batch_rem ? 1 : 0);
+
+    // NRAM buffers:
+    //   nram_acc[oc][pos] — accumulator for current oc_group x L_out
+    //   nram_in[pos]     — one input row
+    __nram__ float nram_acc[N_OC][MAX_L_OUT];
+    __nram__ float nram_in[MAX_L];
+
+    for (uint32_t b = 0; b < my_batches; b++) {
+        uint32_t batch = start_batch + b;
+        float *batch_input = input + batch * in_channels * L;
+
+        // Process output channels in groups of N_OC
+        for (uint32_t oc_start = 0; oc_start < out_channels; oc_start += N_OC) {
+            uint32_t oc_end = (oc_start + N_OC <= out_channels) ? (oc_start + N_OC) : out_channels;
+            uint32_t oc_count = oc_end - oc_start;
+
+            // Zero accumulator for current oc group
+            for (uint32_t oc = 0; oc < oc_count; oc++)
+                for (uint32_t pos = 0; pos < L_out; pos++)
+                    nram_acc[oc][pos] = 0.0f;
+
+            // Accumulate over input channels
+            for (uint32_t ic = 0; ic < in_channels; ic++) {
+                // Load full input row for this input channel
+                __memcpy(nram_in,
+                         batch_input + ic * L,
+                         L * sizeof(float), GDRAM2NRAM);
+
+                // Convolve with each output channel's kernel row
+                for (uint32_t oc = 0; oc < oc_count; oc++) {
+                    uint32_t global_oc = oc_start + oc;
+
+                    // kernel[global_oc][ic][:] — 3 weights
+                    float kw0 = kernel[(global_oc * in_channels + ic) * K + 0];
+                    float kw1 = kernel[(global_oc * in_channels + ic) * K + 1];
+                    float kw2 = kernel[(global_oc * in_channels + ic) * K + 2];
+
+                    // Convolve: acc[oc][pos] += sum_k input[pos+k] * kernel[k]
+                    for (uint32_t pos = 0; pos < L_out; pos++) {
+                        nram_acc[oc][pos] +=
+                            nram_in[pos + 0] * kw0 +
+                            nram_in[pos + 1] * kw1 +
+                            nram_in[pos + 2] * kw2;
+                    }
+                }
+            }
+
+            // Write accumulated output for this oc group
+            float *batch_output = output + batch * out_channels * L_out;
+            for (uint32_t oc = 0; oc < oc_count; oc++) {
+                uint32_t global_oc = oc_start + oc;
+                __memcpy(batch_output + global_oc * L_out,
+                         nram_acc[oc],
+                         L_out * sizeof(float), NRAM2GDRAM);
+            }
+        }
+    }
+}
+
+// C++ wrapper called by PyTorch
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
+                        int in_channels, int out_channels, int kernel_size) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+    torch::Tensor input_fp32 = x;
+    torch::Tensor kernel_fp32 = kernel;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = x.to(torch::kFloat);
+        kernel_fp32 = kernel.to(torch::kFloat);
+    }
+
+    int batch_size = input_fp32.size(0);
+    int L = input_fp32.size(2);
+    int K = kernel_size;
+    int L_out = L - K + 1;  // stride=1, padding=0
+
+    auto output_fp32 = torch::empty(
+        {batch_size, out_channels, L_out}, input_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    conv1d_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch_size, in_channels, out_channels,
+        L, K, L_out
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}
