@@ -34,7 +34,6 @@ __mlu_entry__ void logsoftmax_kernel(
         float row_max = -3e38f;
         for (uint32_t offset = 0; offset < dim_size; offset += CHUNK_SIZE) {
             uint32_t len = (offset + CHUNK_SIZE <= dim_size) ? CHUNK_SIZE : (dim_size - offset);
-            uint32_t aligned_len = (len + 63) & ~63;
 
             __memcpy(nram_buf, row_input + offset,
                      len * sizeof(float), GDRAM2NRAM);
@@ -49,7 +48,6 @@ __mlu_entry__ void logsoftmax_kernel(
         float row_sum = 0.0f;
         for (uint32_t offset = 0; offset < dim_size; offset += CHUNK_SIZE) {
             uint32_t len = (offset + CHUNK_SIZE <= dim_size) ? CHUNK_SIZE : (dim_size - offset);
-            uint32_t aligned_len = (len + 63) & ~63;
 
             __memcpy(nram_buf, row_input + offset,
                      len * sizeof(float), GDRAM2NRAM);
