@@ -74,8 +74,8 @@ torch::Tensor bang_func(torch::Tensor x) {
 
     int total = x_fp32.numel();
 
-    cnrtQueue_t queue =
-        torch_mlu::getCurMLUStream();
+    cnrtQueue_t queue = nullptr;
+    cnrtGetQueue(&queue);
 
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype =

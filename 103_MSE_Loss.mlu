@@ -109,8 +109,8 @@ torch::Tensor bang_func(
 
     int total = pred_fp32.numel();
 
-    cnrtQueue_t queue =
-        torch_mlu::getCurMLUStream();
+    cnrtQueue_t queue = nullptr;
+    cnrtGetQueue(&queue);
 
     cnrtDim3_t dim = {CORE_NUM, 1, 1};
     cnrtFunctionType_t ktype =
