@@ -3,7 +3,7 @@
 #include <cnrt.h>
 
 #define CHUNK_SIZE 4096
-#define CORE_NUM 1
+#define CORE_NUM 4
 
 __mlu_entry__ void mse_kernel(
     float *predictions,
@@ -75,9 +75,7 @@ __mlu_entry__ void mse_kernel(
         local_sum += nram_sum[0];
     }
 
-    if (core_id == 0) {
-        output[0] = local_sum / (float)total;
-    }
+    output[core_id] = local_sum;
 }
 
 
@@ -101,19 +99,19 @@ torch::Tensor bang_func(
         targ_fp32 = targets.to(torch::kFloat);
     }
 
+    int total = pred_fp32.numel();
+
     auto output_fp32 = torch::empty(
-        {1},
+        {CORE_NUM},
         torch::TensorOptions()
             .dtype(torch::kFloat)
             .device(pred_fp32.device()));
-
-    int total = pred_fp32.numel();
 
     cnrtQueue_t queue = nullptr;
 
     cnrtDim3_t dim = {CORE_NUM, 1, 1};
     cnrtFunctionType_t ktype =
-        cnrtFuncTypeBlock;
+        cnrtFuncTypeUnion1;
 
     mse_kernel<<<dim, ktype, queue>>>(
         pred_fp32.data_ptr<float>(),
@@ -121,5 +119,15 @@ torch::Tensor bang_func(
         output_fp32.data_ptr<float>(),
         total);
 
-    return output_fp32[0];
+    auto output_cpu = output_fp32.cpu();
+    float global_sum = 0.0f;
+    for (int i = 0; i < CORE_NUM; i++) {
+        global_sum += output_cpu[i].item<float>();
+    }
+
+    return torch::tensor(
+        global_sum / (float)total,
+        torch::TensorOptions()
+            .dtype(original_dtype)
+            .device(predictions.device()));
 }
