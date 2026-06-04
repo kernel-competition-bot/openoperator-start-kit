@@ -1,0 +1,183 @@
+#include <bang.h>
+#include <cnrt.h>
+
+// 启动配置结构体（与 problem.h 保持一致）
+typedef struct {
+    unsigned int dimX;
+    unsigned int dimY;
+    unsigned int dimZ;
+    cnrtFunctionType_t funcType;
+} KernelLaunchConfig;
+
+// ============================================================================
+// NRAM 缓冲区大小配置
+// ============================================================================
+#define TILE_SIZE       4096    // 单次处理的最大浮点数（NRAM 分块大小）
+#define TASK_SLICE_H    8       // 每个任务处理输出高度方向的元素数
+#define TASK_SLICE_W    8       // 每个任务处理输出宽度方向的元素数
+
+// ============================================================================
+// Kernel 实现：带空洞和填充的二维卷积
+//
+// 并行策略：
+//   每个 task 负责计算输出张量中的一部分（按输出空间位置分块）。
+//   总 task 数 = batch * out_channels * ceil(H_out/TASK_SLICE_H) * ceil(W_out/TASK_SLICE_W)
+//
+//   对于每个 task：
+//     1. 确定负责的输出区域 [ho_start, ho_end) x [wo_start, wo_end)
+//     2. 将整张输入特征图和对应权重加载到 NRAM
+//     3. 对每个输出位置，计算卷积结果
+// ============================================================================
+__mlu_entry__ void DilatedConv2DKernel(float* dst,
+                                        const float* x,
+                                        const float* weight,
+                                        int batch,
+                                        int in_channels,
+                                        int H,
+                                        int W,
+                                        int out_channels,
+                                        int kernel_size,
+                                        int dilation,
+                                        int padding) {
+    // 计算输出尺寸
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+
+    int h_tiles = (H_out + TASK_SLICE_H - 1) / TASK_SLICE_H;
+    int w_tiles = (W_out + TASK_SLICE_W - 1) / TASK_SLICE_W;
+    int tasks_per_oc = h_tiles * w_tiles;
+    int total_tasks_per_batch = out_channels * tasks_per_oc;
+
+    // 根据 taskId 确定当前任务所属的 batch、输出通道和空间分块
+    int total_task_id = taskId;
+    if (total_task_id >= batch * total_tasks_per_batch) return;
+
+    int b  = total_task_id / total_tasks_per_batch;
+    int r  = total_task_id % total_tasks_per_batch;
+    int oc = r / tasks_per_oc;
+    int sp = r % tasks_per_oc;
+    int ht = sp / w_tiles;
+    int wt = sp % w_tiles;
+
+    int ho_start = ht * TASK_SLICE_H;
+    int ho_end   = ho_start + TASK_SLICE_H;
+    if (ho_end > H_out) ho_end = H_out;
+
+    int wo_start = wt * TASK_SLICE_W;
+    int wo_end   = wo_start + TASK_SLICE_W;
+    if (wo_end > W_out) wo_end = W_out;
+
+    // ========================================================================
+    // 将输入特征图 [in_channels, H, W] 加载到 NRAM
+    // ========================================================================
+    int x_plane_size = H * W;                        // 单个通道的像素数
+    int x_channel_size = in_channels * x_plane_size; // 所有通道的像素数
+    int x_base = b * x_channel_size;                 // 当前 batch 在 x 中的起始偏移
+
+    // 将权重 [oc, :, :, :] 加载到 NRAM
+    int w_per_oc = in_channels * kernel_size * kernel_size; // 每个输出通道的权重数
+    int w_base = oc * w_per_oc;                              // 当前输出通道在 weight 中的起始偏移
+
+    // ========================================================================
+    // 逐输出位置计算卷积
+    // 使用 NRAM 缓冲区逐 tile 加载输入/权重数据
+    // ========================================================================
+    __nram__ float nram_x[TILE_SIZE];     // 输入缓冲区
+    __nram__ float nram_w[TILE_SIZE];     // 权重缓冲区
+
+    for (int ho = ho_start; ho < ho_end; ho++) {
+        for (int wo = wo_start; wo < wo_end; wo++) {
+            float sum = 0.0f;
+
+            for (int ic = 0; ic < in_channels; ic++) {
+                for (int kh = 0; kh < kernel_size; kh++) {
+                    int hi = ho - padding + kh * dilation;
+
+                    // 跳过超出输入范围的 kernel 行
+                    if (hi < 0 || hi >= H) continue;
+
+                    for (int kw = 0; kw < kernel_size; kw++) {
+                        int wi = wo - padding + kw * dilation;
+
+                        // 跳过超出输入范围的 kernel 列
+                        if (wi < 0 || wi >= W) continue;
+
+                        // 从 GDRAM 加载输入元素
+                        int x_idx = x_base + ic * x_plane_size + hi * W + wi;
+                        // 从 GDRAM 加载权重元素
+                        int w_idx = w_base + ic * kernel_size * kernel_size + kh * kernel_size + kw;
+
+                        // 使用标量加载（每个元素单独访存）
+                        float x_val, w_val;
+                        __memcpy(&x_val, x + x_idx, sizeof(float), GDRAM2NRAM);
+                        __memcpy(&w_val, weight + w_idx, sizeof(float), GDRAM2NRAM);
+
+                        sum += x_val * w_val;
+                    }
+                }
+            }
+
+            // 写入输出
+            int d_idx = ((b * out_channels + oc) * H_out + ho) * W_out + wo;
+            __memcpy(dst + d_idx, &sum, sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+// ============================================================================
+// 获取启动配置
+// ============================================================================
+extern "C" KernelLaunchConfig GetLaunchConfig(int batch,
+                                               int in_channels,
+                                               int H,
+                                               int W,
+                                               int out_channels,
+                                               int kernel_size,
+                                               int dilation,
+                                               int padding) {
+    KernelLaunchConfig config;
+
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) + 1;
+
+    int h_tiles = (H_out + TASK_SLICE_H - 1) / TASK_SLICE_H;
+    int w_tiles = (W_out + TASK_SLICE_W - 1) / TASK_SLICE_W;
+    int tasks_per_oc = h_tiles * w_tiles;
+    int num_tasks = batch * out_channels * tasks_per_oc;
+
+    if (num_tasks < 1) num_tasks = 1;
+
+    config.dimX = (unsigned int)num_tasks;
+    config.dimY = 1;
+    config.dimZ = 1;
+    config.funcType = cnrtFuncTypeBlock;
+
+    return config;
+}
+
+// ============================================================================
+// Kernel 启动包装函数（供 evaluator 调用）
+// ============================================================================
+extern "C" void LaunchDilatedConv2DKernel(float* dst,
+                                           const float* x,
+                                           const float* weight,
+                                           int batch,
+                                           int in_channels,
+                                           int H,
+                                           int W,
+                                           int out_channels,
+                                           int kernel_size,
+                                           int dilation,
+                                           int padding,
+                                           cnrtQueue_t queue) {
+    KernelLaunchConfig config = GetLaunchConfig(batch, in_channels,
+                                                 H, W, out_channels,
+                                                 kernel_size, dilation, padding);
+    cnrtDim3_t dim = {config.dimX, config.dimY, config.dimZ};
+    cnrtFunctionType_t ktype = config.funcType;
+
+    DilatedConv2DKernel<<<dim, ktype, queue>>>(dst, x, weight,
+                                                batch, in_channels, H, W,
+                                                out_channels, kernel_size,
+                                                dilation, padding);
+}

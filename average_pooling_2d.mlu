@@ -1,0 +1,137 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define NRAM_BUF_SIZE 65536
+
+__mlu_entry__ void average_pooling_2d_kernel(
+    float *x,
+    float *output,
+    int N, int C, int H, int W,
+    int kernel_size, int H_out, int W_out)
+{
+    int plane_size = H * W;
+    int out_plane_size = H_out * W_out;
+    int total_planes = N * C;
+
+    // 按 (n,c) 平面拆分任务
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+    uint32_t per_task = total_planes / task_num;
+    uint32_t rem = total_planes % task_num;
+    uint32_t start = task_id * per_task
+                     + (task_id < rem ? task_id : rem);
+    uint32_t count = per_task + (task_id < rem ? 1 : 0);
+
+    float scale = 1.0f / (float)(kernel_size * kernel_size);
+
+    // 计算高度方向分 tile 参数
+    // 每 buffer 最多容纳的输入行数，对齐到 kernel_size 整数倍
+    int max_tile_rows = NRAM_BUF_SIZE / W;
+    int rows_per_tile = (max_tile_rows / kernel_size) * kernel_size;
+    if (rows_per_tile < kernel_size) rows_per_tile = kernel_size;
+
+    // 双缓冲
+    __nram__ float buf_A[NRAM_BUF_SIZE];
+    __nram__ float buf_B[NRAM_BUF_SIZE];
+
+    for (uint32_t p_idx = 0; p_idx < count; p_idx++) {
+        int plane_idx = start + p_idx;
+
+        float *input_plane = x + plane_idx * plane_size;
+        float *output_plane = output + plane_idx * out_plane_size;
+
+        int num_h_tiles = (H + rows_per_tile - 1) / rows_per_tile;
+
+        for (int t = 0; t < num_h_tiles; t++) {
+            int h_start = t * rows_per_tile;
+            int h_end = h_start + rows_per_tile;
+            if (h_end > H) h_end = H;
+            int tile_h = h_end - h_start;
+
+            // 双缓冲选择
+            float *cur_buf = (t % 2 == 0) ? buf_A : buf_B;
+            float *next_buf = (t % 2 == 0) ? buf_B : buf_A;
+
+            // 加载当前 tile 的所有行到 NRAM
+            __memcpy(cur_buf, input_plane + h_start * W,
+                     tile_h * W * sizeof(float), GDRAM2NRAM);
+
+            // 预取下一个 tile（有下一个 tile 时才执行）
+            if (t + 1 < num_h_tiles) {
+                int next_h_start = (t + 1) * rows_per_tile;
+                int next_h_end = next_h_start + rows_per_tile;
+                if (next_h_end > H) next_h_end = H;
+                int next_tile_h = next_h_end - next_h_start;
+                __memcpy(next_buf,
+                         input_plane + next_h_start * W,
+                         next_tile_h * W * sizeof(float), GDRAM2NRAM);
+            }
+
+            // 计算该 tile 覆盖的输出行范围
+            int ho_start = h_start / kernel_size;
+            int ho_end = (h_end - kernel_size) / kernel_size + 1;
+            if (ho_end > H_out) ho_end = H_out;
+
+            // 从 NRAM 计算该 tile 内的所有输出位置
+            for (int ho = ho_start; ho < ho_end; ho++) {
+                // NRAM 内的行偏移（相对于 tile 起始）
+                int h_local = ho * kernel_size - h_start;
+                for (int wo = 0; wo < W_out; wo++) {
+                    int w_start = wo * kernel_size;
+                    float sum = 0.0f;
+                    for (int kh = 0; kh < kernel_size; kh++) {
+                        int row_off = (h_local + kh) * W;
+                        for (int kw = 0; kw < kernel_size; kw++) {
+                            sum += cur_buf[row_off + w_start + kw];
+                        }
+                    }
+                    output_plane[ho * W_out + wo] = sum * scale;
+                }
+            }
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int kernel_size)
+{
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int N = x_fp32.size(0);
+    int C = x_fp32.size(1);
+    int H = x_fp32.size(2);
+    int W = x_fp32.size(3);
+
+    int H_out = H / kernel_size;
+    int W_out = W / kernel_size;
+
+    auto output_fp32 = torch::empty({N, C, H_out, W_out},
+                                    x_fp32.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {64, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    average_pooling_2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, C, H, W,
+        kernel_size, H_out, W_out);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
