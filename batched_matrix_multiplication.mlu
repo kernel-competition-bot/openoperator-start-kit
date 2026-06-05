@@ -95,7 +95,7 @@ torch::Tensor bang_func(
 
     int total = batch_size * m * n;
     int task_num = (total < 64) ? total : 64;
-    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     batched_matmul_kernel<<<dim, ktype, queue>>>(

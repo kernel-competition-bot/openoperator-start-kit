@@ -116,7 +116,7 @@ torch::Tensor bang_func(
 
     int work_items = (axis == 1) ? batch_size : feature_dim;
     int task_num = (work_items < 64) ? work_items : 64;
-    cnrtDim3_t kernel_dim = {task_num, 1, 1};
+    cnrtDim3_t kernel_dim = {static_cast<unsigned int>(task_num), 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     logsoftmax2d_kernel<<<kernel_dim, ktype, queue>>>(
