@@ -1,0 +1,142 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define K_TILE 4096
+#define NFU_ALIGN 64
+
+/* Batch matrix multiplication for contiguous float16 tensors.
+ *
+ * A: [batch_size, m, k]
+ * B: [batch_size, k, n]
+ * C: [batch_size, m, n]
+ *
+ * The kernel assigns output elements across tasks.  Each output element is a
+ * dot product over k, computed in float after converting half tiles in NRAM,
+ * then converted back to half for the required output format.
+ */
+__mlu_entry__ void batch_matmul_half_kernel(
+    half *C,
+    const half *A,
+    const half *B,
+    int batch_size,
+    int m,
+    int k,
+    int n)
+{
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+
+    int total = batch_size * m * n;
+    uint32_t per_task = (uint32_t)total / task_num;
+    uint32_t remainder = (uint32_t)total % task_num;
+    uint32_t start = task_id * per_task +
+                     (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task +
+                     (task_id < remainder ? 1 : 0);
+
+    __nram__ half nram_a_half[K_TILE + NFU_ALIGN];
+    __nram__ half nram_b_half[K_TILE + NFU_ALIGN];
+    __nram__ float nram_a_float[K_TILE + NFU_ALIGN];
+    __nram__ float nram_b_float[K_TILE + NFU_ALIGN];
+    __nram__ float nram_product[K_TILE + NFU_ALIGN];
+    __nram__ float nram_sum[1];
+
+    for (uint32_t offset = 0; offset < count; offset++) {
+        int out_index = (int)(start + offset);
+
+        int batch = out_index / (m * n);
+        int inner = out_index - batch * m * n;
+        int row = inner / n;
+        int col = inner - row * n;
+
+        int a_base = batch * m * k + row * k;
+        int b_base = batch * k * n + col;
+
+        float acc = 0.0f;
+
+        for (int k_base = 0; k_base < k; k_base += K_TILE) {
+            int tile = (k_base + K_TILE <= k) ? K_TILE : (k - k_base);
+            int aligned_tile = (tile + NFU_ALIGN - 1) & ~(NFU_ALIGN - 1);
+
+            __memcpy(nram_a_half,
+                     A + a_base + k_base,
+                     tile * sizeof(half),
+                     GDRAM2NRAM);
+
+            for (int i = 0; i < tile; i++) {
+                nram_b_half[i] = B[b_base + (k_base + i) * n];
+            }
+            for (int i = tile; i < aligned_tile; i++) {
+                nram_a_half[i] = (half)0.0f;
+                nram_b_half[i] = (half)0.0f;
+            }
+
+            __bang_half2float(nram_a_float, nram_a_half, aligned_tile);
+            __bang_half2float(nram_b_float, nram_b_half, aligned_tile);
+            __bang_mul(nram_product, nram_a_float, nram_b_float,
+                       aligned_tile);
+            __bang_sum(nram_sum, nram_product, aligned_tile);
+
+            acc += nram_sum[0];
+        }
+
+        C[out_index] = (half)acc;
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor A,
+    torch::Tensor B)
+{
+    TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
+    TORCH_CHECK(A.dim() == 3, "A must be 3D: [batch_size, m, k]");
+    TORCH_CHECK(B.dim() == 3, "B must be 3D: [batch_size, k, n]");
+
+    int batch_size = (int)A.size(0);
+    int m = (int)A.size(1);
+    int k = (int)A.size(2);
+    int b_batch = (int)B.size(0);
+    int b_k = (int)B.size(1);
+    int n = (int)B.size(2);
+
+    TORCH_CHECK(batch_size == b_batch,
+                "A and B must have the same batch_size");
+    TORCH_CHECK(k == b_k,
+                "A.size(2) must equal B.size(1)");
+    TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
+    TORCH_CHECK(m > 0, "m must be greater than 0");
+    TORCH_CHECK(k > 0, "k must be greater than 0");
+    TORCH_CHECK(n > 0, "n must be greater than 0");
+
+    torch::Tensor A_half = A;
+    torch::Tensor B_half = B;
+    if (A.scalar_type() != torch::kHalf) {
+        A_half = A.to(torch::kHalf);
+    }
+    if (B.scalar_type() != torch::kHalf) {
+        B_half = B.to(torch::kHalf);
+    }
+
+    auto C = torch::empty({batch_size, m, n}, A_half.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    int total = batch_size * m * n;
+    int task_num = (total < 64) ? total : 64;
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    batch_matmul_half_kernel<<<dim, ktype, queue>>>(
+        (half *)C.data_ptr(),
+        (const half *)A_half.data_ptr(),
+        (const half *)B_half.data_ptr(),
+        batch_size,
+        m,
+        k,
+        n);
+
+    return C;
+}
