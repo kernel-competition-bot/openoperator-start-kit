@@ -1,0 +1,167 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+#define BATCH 128
+#define NCLASS 1024
+#define TOTAL_ELEMS (BATCH * NCLASS)
+
+#define TASK_DIM 64
+#define CHUNK 1024
+#define REDUCE_ALIGNED 128
+
+#define SCALE_Q 1024.0f
+#define LOG_1024 6.931471805599453f
+
+__mlu_entry__ void kl_divergence_partial_kernel(
+    const float *input_log_prob,
+    const float *target_prob,
+    float *partial
+) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ float inbuf[CHUNK];
+    __nram__ float tbuf[CHUNK];
+    __nram__ float work[CHUNK];
+    __nram__ float red[CHUNK];
+
+    float local_sum = 0.0f;
+
+    int per = (TOTAL_ELEMS + tnum - 1) / tnum;
+    int start = tid * per;
+    int end = start + per;
+    if (end > TOTAL_ELEMS) {
+        end = TOTAL_ELEMS;
+    }
+
+    for (int pos = start; pos < end; pos += CHUNK) {
+        int len = end - pos;
+        if (len > CHUNK) {
+            len = CHUNK;
+        }
+
+        int aligned_len = (len + 31) & ~31;
+        if (aligned_len > CHUNK) {
+            aligned_len = CHUNK;
+        }
+
+        __memcpy(inbuf,
+                 input_log_prob + pos,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
+
+        __memcpy(tbuf,
+                 target_prob + pos,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
+
+        // padding contribution = 0
+        // target=1, input_log_prob=0:
+        // 1 * (log(1*1024) - log(1024) - 0) = 0
+        for (int i = len; i < aligned_len; ++i) {
+            inbuf[i] = 0.0f;
+            tbuf[i] = 1.0f;
+        }
+
+        // work = target_prob * 1024
+        __bang_mul_const(work, tbuf, SCALE_Q, aligned_len);
+
+        // work = log(target_prob * 1024)
+        __bang_active_log(work, work, aligned_len);
+
+        // work = log(target_prob * 1024) - log(1024)
+        __bang_sub_const(work, work, LOG_1024, aligned_len);
+
+        // work = log(target_prob) - input_log_prob
+        __bang_sub(work, work, inbuf, aligned_len);
+
+        // work = target_prob * (log(target_prob) - input_log_prob)
+        __bang_mul(work, work, tbuf, aligned_len);
+
+        __bang_reduce_sum(red, work, aligned_len);
+
+        for (int i = 0; i < aligned_len; i += 32) {
+            local_sum += red[i];
+        }
+    }
+
+    partial[tid] = local_sum;
+}
+
+
+__mlu_entry__ void kl_divergence_final_kernel(
+    const float *partial,
+    float *out
+) {
+    __nram__ float pbuf[REDUCE_ALIGNED];
+
+    __bang_write_zero(pbuf, REDUCE_ALIGNED);
+
+    __memcpy(pbuf,
+             partial,
+             TASK_DIM * sizeof(float),
+             GDRAM2NRAM);
+
+    float total = 0.0f;
+
+    for (int i = 0; i < TASK_DIM; ++i) {
+        total += pbuf[i];
+    }
+
+    out[0] = total / (float)BATCH;
+}
+
+
+torch::Tensor bang_func(torch::Tensor input_log_prob,
+                        torch::Tensor target_prob) {
+    TORCH_CHECK(input_log_prob.is_contiguous(), "input_log_prob must be contiguous");
+    TORCH_CHECK(target_prob.is_contiguous(), "target_prob must be contiguous");
+
+    TORCH_CHECK(input_log_prob.dtype() == torch::kFloat32, "input_log_prob must be FP32");
+    TORCH_CHECK(target_prob.dtype() == torch::kFloat32, "target_prob must be FP32");
+
+    TORCH_CHECK(input_log_prob.dim() == 2, "input_log_prob must be 2D");
+    TORCH_CHECK(target_prob.dim() == 2, "target_prob must be 2D");
+
+    TORCH_CHECK(input_log_prob.size(0) == BATCH, "v1 assumes batch=128");
+    TORCH_CHECK(input_log_prob.size(1) == NCLASS, "v1 assumes num_classes=1024");
+    TORCH_CHECK(target_prob.size(0) == BATCH, "v1 assumes batch=128");
+    TORCH_CHECK(target_prob.size(1) == NCLASS, "v1 assumes num_classes=1024");
+
+    auto partial = torch::empty(
+        {TASK_DIM},
+        input_log_prob.options()
+    );
+
+    auto out = torch::empty(
+        {},
+        input_log_prob.options()
+    );
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim1 = {TASK_DIM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    kl_divergence_partial_kernel<<<dim1, ktype, queue>>>(
+        input_log_prob.data_ptr<float>(),
+        target_prob.data_ptr<float>(),
+        partial.data_ptr<float>()
+    );
+
+    cnrtDim3_t dim2 = {1, 1, 1};
+
+    kl_divergence_final_kernel<<<dim2, ktype, queue>>>(
+        partial.data_ptr<float>(),
+        out.data_ptr<float>()
+    );
+
+    return out;
+}
+
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "KL_Divergence_Loss");
+}

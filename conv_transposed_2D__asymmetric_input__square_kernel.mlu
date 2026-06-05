@@ -1,0 +1,309 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+#define BATCH 16
+#define IC 32
+#define OC 64
+#define H_IN 128
+#define W_IN 256
+#define K_SIZE 3
+#define H_OUT 130
+#define W_OUT 258
+
+#define TILE_W 256
+#define NUM_TILES 2
+#define TILE_ALIGNED 256
+
+#define OC_BLOCK 16
+#define OC_BLOCKS (OC / OC_BLOCK)
+
+#define TASK_DIM 64
+
+#define K_BLOCK_ELEMS (IC * OC_BLOCK * K_SIZE * K_SIZE)
+
+#define ACCUM_OB(OB, ACC) do {                                      \
+    float wv = kbuf[((ic * OC_BLOCK + (OB)) * K_SIZE * K_SIZE)       \
+                    + kh * K_SIZE + kw];                            \
+    __bang_mul_const(tmp, xbuf, wv, aligned_len);                    \
+    __bang_add((ACC), (ACC), tmp, aligned_len);                      \
+} while (0)
+
+#define STORE_OB(OB, ACC) do {                                      \
+    int oc = oc0 + (OB);                                            \
+    int out_base = ((n * OC + oc) * H_OUT + oh) * W_OUT + ow0;       \
+    __memcpy(out + out_base,                                        \
+             (ACC),                                                  \
+             len * sizeof(float),                                   \
+             NRAM2GDRAM);                                           \
+} while (0)
+
+__mlu_entry__ void conv_transpose2d_v3_kernel(
+    const float *x,
+    const float *kernel,
+    float *out,
+    int n,
+    int ocb
+) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ float acc0[TILE_ALIGNED];
+    __nram__ float acc1[TILE_ALIGNED];
+    __nram__ float acc2[TILE_ALIGNED];
+    __nram__ float acc3[TILE_ALIGNED];
+    __nram__ float acc4[TILE_ALIGNED];
+    __nram__ float acc5[TILE_ALIGNED];
+    __nram__ float acc6[TILE_ALIGNED];
+    __nram__ float acc7[TILE_ALIGNED];
+    __nram__ float acc8[TILE_ALIGNED];
+    __nram__ float acc9[TILE_ALIGNED];
+    __nram__ float acc10[TILE_ALIGNED];
+    __nram__ float acc11[TILE_ALIGNED];
+    __nram__ float acc12[TILE_ALIGNED];
+    __nram__ float acc13[TILE_ALIGNED];
+    __nram__ float acc14[TILE_ALIGNED];
+    __nram__ float acc15[TILE_ALIGNED];
+
+    __nram__ float xbuf[TILE_ALIGNED];
+    __nram__ float tmp[TILE_ALIGNED];
+
+    // kernel block: [IC, OC_BLOCK, 3, 3]
+    __nram__ float kbuf[K_BLOCK_ELEMS];
+
+    int oc0 = ocb * OC_BLOCK;
+
+    // preload kernel block into NRAM
+    for (int icp = 0; icp < IC; ++icp) {
+        int src_k_base = ((icp * OC + oc0) * K_SIZE * K_SIZE);
+        int dst_k_base = icp * OC_BLOCK * K_SIZE * K_SIZE;
+
+        __memcpy(kbuf + dst_k_base,
+                 kernel + src_k_base,
+                 OC_BLOCK * K_SIZE * K_SIZE * sizeof(float),
+                 GDRAM2NRAM);
+    }
+
+    int total_tiles = H_OUT * NUM_TILES;
+
+    for (int tile_id = tid; tile_id < total_tiles; tile_id += tnum) {
+        int ow_tile = tile_id % NUM_TILES;
+        int oh = tile_id / NUM_TILES;
+
+        int ow0 = ow_tile * TILE_W;
+        int len = W_OUT - ow0;
+        if (len > TILE_W) {
+            len = TILE_W;
+        }
+
+        int aligned_len = (len + 31) & ~31;
+        if (aligned_len > TILE_ALIGNED) {
+            aligned_len = TILE_ALIGNED;
+        }
+
+        __bang_write_zero(acc0, aligned_len);
+        __bang_write_zero(acc1, aligned_len);
+        __bang_write_zero(acc2, aligned_len);
+        __bang_write_zero(acc3, aligned_len);
+        __bang_write_zero(acc4, aligned_len);
+        __bang_write_zero(acc5, aligned_len);
+        __bang_write_zero(acc6, aligned_len);
+        __bang_write_zero(acc7, aligned_len);
+        __bang_write_zero(acc8, aligned_len);
+        __bang_write_zero(acc9, aligned_len);
+        __bang_write_zero(acc10, aligned_len);
+        __bang_write_zero(acc11, aligned_len);
+        __bang_write_zero(acc12, aligned_len);
+        __bang_write_zero(acc13, aligned_len);
+        __bang_write_zero(acc14, aligned_len);
+        __bang_write_zero(acc15, aligned_len);
+
+        // transposed conv:
+        // out[n, oc, oh, ow] += x[n, ic, ih, iw] * kernel[ic, oc, kh, kw]
+        // stride=1, padding=0:
+        // oh = ih + kh, ow = iw + kw
+        for (int ic = 0; ic < IC; ++ic) {
+            for (int kh = 0; kh < K_SIZE; ++kh) {
+                int ih = oh - kh;
+
+                if (ih < 0 || ih >= H_IN) {
+                    continue;
+                }
+
+                for (int kw = 0; kw < K_SIZE; ++kw) {
+                    int valid_start = ow0;
+                    if (valid_start < kw) {
+                        valid_start = kw;
+                    }
+
+                    int valid_end = ow0 + len;
+                    int max_ow = W_IN + kw;
+                    if (valid_end > max_ow) {
+                        valid_end = max_ow;
+                    }
+
+                    if (valid_start >= valid_end) {
+                        continue;
+                    }
+
+                    int off = valid_start - ow0;
+                    int valid_len = valid_end - valid_start;
+                    int iw_start = valid_start - kw;
+
+                    int x_base =
+                        ((n * IC + ic) * H_IN + ih) * W_IN + iw_start;
+
+                    if (off == 0 && valid_len == len && len == aligned_len) {
+                        __memcpy(xbuf,
+                                 x + x_base,
+                                 valid_len * sizeof(float),
+                                 GDRAM2NRAM);
+                    } else {
+                        __bang_write_zero(xbuf, aligned_len);
+
+                        __memcpy(xbuf + off,
+                                 x + x_base,
+                                 valid_len * sizeof(float),
+                                 GDRAM2NRAM);
+                    }
+
+                    ACCUM_OB(0, acc0);
+                    ACCUM_OB(1, acc1);
+                    ACCUM_OB(2, acc2);
+                    ACCUM_OB(3, acc3);
+                    ACCUM_OB(4, acc4);
+                    ACCUM_OB(5, acc5);
+                    ACCUM_OB(6, acc6);
+                    ACCUM_OB(7, acc7);
+                    ACCUM_OB(8, acc8);
+                    ACCUM_OB(9, acc9);
+                    ACCUM_OB(10, acc10);
+                    ACCUM_OB(11, acc11);
+                    ACCUM_OB(12, acc12);
+                    ACCUM_OB(13, acc13);
+                    ACCUM_OB(14, acc14);
+                    ACCUM_OB(15, acc15);
+                }
+            }
+        }
+
+        STORE_OB(0, acc0);
+        STORE_OB(1, acc1);
+        STORE_OB(2, acc2);
+        STORE_OB(3, acc3);
+        STORE_OB(4, acc4);
+        STORE_OB(5, acc5);
+        STORE_OB(6, acc6);
+        STORE_OB(7, acc7);
+        STORE_OB(8, acc8);
+        STORE_OB(9, acc9);
+        STORE_OB(10, acc10);
+        STORE_OB(11, acc11);
+        STORE_OB(12, acc12);
+        STORE_OB(13, acc13);
+        STORE_OB(14, acc14);
+        STORE_OB(15, acc15);
+    }
+}
+
+torch::Tensor conv_transpose2d_impl(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    bool bias
+) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "kernel must be contiguous");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "x must be FP32");
+    TORCH_CHECK(kernel.dtype() == torch::kFloat32, "kernel must be FP32");
+
+    TORCH_CHECK(in_channels == IC, "v3 assumes in_channels=32");
+    TORCH_CHECK(out_channels == OC, "v3 assumes out_channels=64");
+    TORCH_CHECK(kernel_size == K_SIZE, "v3 assumes kernel_size=3");
+    TORCH_CHECK(stride == 1, "v3 assumes stride=1");
+    TORCH_CHECK(padding == 0, "v3 assumes padding=0");
+    TORCH_CHECK(output_padding == 0, "v3 assumes output_padding=0");
+    TORCH_CHECK(groups == 1, "v3 assumes groups=1");
+    TORCH_CHECK(bias == false, "v3 assumes bias=false");
+
+    auto out = torch::empty(
+        {BATCH, OC, H_OUT, W_OUT},
+        x.options()
+    );
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {TASK_DIM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    // 16 batch × 4 oc_block = 64 launches
+    for (int n = 0; n < BATCH; ++n) {
+        for (int ocb = 0; ocb < OC_BLOCKS; ++ocb) {
+            conv_transpose2d_v3_kernel<<<dim, ktype, queue>>>(
+                x.data_ptr<float>(),
+                kernel.data_ptr<float>(),
+                out.data_ptr<float>(),
+                n,
+                ocb
+            );
+        }
+    }
+
+    return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func",
+          [](torch::Tensor x,
+             torch::Tensor kernel,
+             int in_channels,
+             int out_channels,
+             int kernel_size) {
+              return conv_transpose2d_impl(
+                  x,
+                  kernel,
+                  in_channels,
+                  out_channels,
+                  kernel_size,
+                  1,
+                  0,
+                  0,
+                  1,
+                  false
+              );
+          },
+          "conv_transpose2d short wrapper");
+
+    m.def("bang_func",
+          [](torch::Tensor x,
+             torch::Tensor kernel,
+             int in_channels,
+             int out_channels,
+             int kernel_size,
+             int stride,
+             int padding,
+             int output_padding,
+             int groups,
+             bool bias) {
+              return conv_transpose2d_impl(
+                  x,
+                  kernel,
+                  in_channels,
+                  out_channels,
+                  kernel_size,
+                  stride,
+                  padding,
+                  output_padding,
+                  groups,
+                  bias
+              );
+          },
+          "conv_transpose2d full wrapper");
+}
