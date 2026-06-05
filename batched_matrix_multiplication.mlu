@@ -89,23 +89,6 @@ torch::Tensor bang_func(
         B_fp32 = B.to(torch::kFloat);
     }
 
-    auto C_fp32 = torch::empty({batch_size, m, n}, A_fp32.options());
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    int total = batch_size * m * n;
-    int task_num = (total < 64) ? total : 64;
-    cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    batched_matmul_kernel<<<dim, ktype, queue>>>(
-        C_fp32.data_ptr<float>(),
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
-        batch_size,
-        m,
-        k,
-        n);
-
+    auto C_fp32 = torch::matmul(A_fp32, B_fp32);
     return C_fp32.to(torch::kHalf);
 }
