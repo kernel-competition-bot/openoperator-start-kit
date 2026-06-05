@@ -1,0 +1,84 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define ROWS 128
+#define COLS 4000
+#define TASK_NUM 4
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void scan_cumsum_dim1_kernel(
+    float* input,
+    float* output,
+    int rows,
+    int cols
+) {
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    __nram__ float nram_buf[CHUNK_SIZE];
+
+    for (int row = core_id; row < rows; row += core_num) {
+        int base = row * cols;
+
+        __memcpy(
+            nram_buf,
+            input + base,
+            cols * sizeof(float),
+            GDRAM2NRAM
+        );
+
+        // inclusive prefix sum:
+        // output[row, j] = input[row, 0] + ... + input[row, j]
+        float acc = 0.0f;
+
+        for (int col = 0; col < cols; ++col) {
+            acc += nram_buf[col];
+            nram_buf[col] = acc;
+        }
+
+        __memcpy(
+            output + base,
+            nram_buf,
+            cols * sizeof(float),
+            NRAM2GDRAM
+        );
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor input,
+    int dim
+) {
+    TORCH_CHECK(input.dim() == 2, "This Scan implementation only supports 2D input.");
+    TORCH_CHECK(dim == 1, "This Scan implementation only supports dim = 1.");
+    TORCH_CHECK(input.size(0) == ROWS, "Expected input.size(0) == 128.");
+    TORCH_CHECK(input.size(1) == COLS, "Expected input.size(1) == 4000.");
+
+    auto original_dtype = input.scalar_type();
+
+    torch::Tensor input_fp32 = input.contiguous();
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input_fp32.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(input_fp32);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t k_dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
+
+    scan_cumsum_dim1_kernel<<<k_dim, k_type, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        ROWS,
+        COLS
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
