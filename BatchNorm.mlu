@@ -1,0 +1,176 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+/* ============================================================================
+ * BatchNorm2D Kernel
+ *
+ * 对四维张量 [batch, channels, H, W] 执行逐通道的批归一化：
+ *
+ *   mean[c] = (1 / N*H*W) * \sum_{n,h,w} x[n, c, h, w]
+ *   var[c]  = (1 / N*H*W) * \sum_{n,h,w} (x[n, c, h, w] - mean[c])^2
+ *   y[n, c, h, w] = gamma[c] * (x - mean[c]) / sqrt(var[c] + eps) + beta[c]
+ *
+ * 多核拆分：按通道维度拆分，每个 core 独立处理若干通道的完整计算。
+ * 每个通道两趟遍历：
+ *   Pass 1 — 累加 sum 与 sum_sq（利用 Var = E[X²] - E[X]²）
+ *   Pass 2 — 用均值/方差做归一化并写出结果
+ * ============================================================================
+ */
+__mlu_entry__ void batchnorm2d_kernel(
+    const float* input,       // [N, C, H, W]
+    const float* weight,      // [C]   — gamma  缩放参数
+    const float* bias,        // [C]   — beta   偏移参数
+    float* output,            // [N, C, H, W]
+    int N,
+    int C,
+    int H,
+    int W,
+    float eps)
+{
+    // ========================================================================
+    // 多核拆分：按通道 (C) 维度均分
+    // ========================================================================
+    uint32_t core_id   = taskId;
+    uint32_t core_num  = taskDim;
+    uint32_t per_core  = (uint32_t)C / core_num;
+    uint32_t remainder = (uint32_t)C % core_num;
+
+    uint32_t start_c = core_id * per_core +
+                       (core_id < remainder ? core_id : remainder);
+    uint32_t count_c = per_core +
+                       (core_id < remainder ? 1 : 0);
+
+    int spatial_size       = H * W;          // 单通道空间元素数
+    int channel_stride     = spatial_size;   // 相邻通道间距
+    int batch_chunk_stride = C * spatial_size; // 相邻 batch 间距
+    float N_total          = (float)(N * spatial_size); // 归一化分母
+
+    // ========================================================================
+    // 遍历分配给本 core 的每个通道
+    // ========================================================================
+    for (uint32_t c_idx = 0; c_idx < count_c; c_idx++) {
+        int c = (int)(start_c + c_idx);
+
+        // ---- Pass 1: 累加 sum 与 sum_sq（一次遍历完成） ----
+        float sum   = 0.0f;
+        float sum_sq = 0.0f;
+
+        for (int n = 0; n < N; n++) {
+            const float* ch_start =
+                input + n * batch_chunk_stride + c * channel_stride;
+
+            for (int i = 0; i < spatial_size; i++) {
+                float val = ch_start[i];
+                sum   += val;
+                sum_sq += val * val;
+            }
+        }
+
+        // 均值与方差: E[X] 与 E[X²] - E[X]²
+        float mean = sum / N_total;
+        float var  = sum_sq / N_total - mean * mean;
+        // 防止数值问题导致负方差
+        if (var < 0.0f) var = 0.0f;
+
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float gamma   = weight[c];
+        float beta    = bias[c];
+
+        // ---- Pass 2: 归一化并写出 ----
+        for (int n = 0; n < N; n++) {
+            const float* in_ch =
+                input + n * batch_chunk_stride + c * channel_stride;
+            float* out_ch =
+                output + n * batch_chunk_stride + c * channel_stride;
+
+            for (int i = 0; i < spatial_size; i++) {
+                float x_hat = (in_ch[i] - mean) * inv_std;
+                out_ch[i]   = gamma * x_hat + beta;
+            }
+        }
+    }
+}
+
+
+/* ============================================================================
+ * bang_func — 外部调用接口
+ *
+ * 严格匹配 C++ Wrapper 签名:
+ *   torch::Tensor bang_func(torch::Tensor x, int num_features);
+ *
+ * 内部行为与 PyTorch nn.BatchNorm2d 对齐:
+ *   - 初始化 gamma = ones(num_features), beta = zeros(num_features)
+ *   - 使用 eps = 1e-5 (PyTorch 默认值)
+ *   - 按当前 batch 计算均值/方差后归一化 (training mode)
+ *
+ * 参数:
+ *   x:            输入张量，形状 [batch, channels, H, W]
+ *   num_features: 特征通道数 C
+ *
+ * 返回值:
+ *   归一化后的张量，形状与 x 相同 [batch, channels, H, W]
+ * ============================================================================
+ */
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int num_features)
+{
+    // 输入校验
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dim() == 4,      "Input must be 4D: [N, C, H, W]");
+
+    int C = (int)x.size(1);
+    TORCH_CHECK(C == num_features,
+                "num_features ", num_features, " != input channel ", C);
+
+    // 保留原始 dtype
+    auto original_dtype = x.scalar_type();
+
+    // -------- 统一转为 float32 计算 --------
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    // -------- 内部创建 gamma / beta（与 nn.BatchNorm2d 默认初始化一致）--------
+    // gamma 初始化为全 1，beta 初始化为全 0，放在与输入相同的 MLU 设备上
+    auto gamma = torch::ones(
+        {num_features},
+        torch::TensorOptions().dtype(torch::kFloat).device(x_fp32.device()));
+    auto beta = torch::zeros(
+        {num_features},
+        torch::TensorOptions().dtype(torch::kFloat).device(x_fp32.device()));
+
+    // PyTorch 默认 eps = 1e-5
+    const float eps = 1e-5f;
+
+    // 维度信息
+    int N = (int)x_fp32.size(0);
+    int H = (int)x_fp32.size(2);
+    int W = (int)x_fp32.size(3);
+
+    // -------- 分配输出张量 (与输入在同一设备) --------
+    auto output_fp32 = torch::empty_like(x_fp32);
+
+    // -------- 获取 MLU Stream 并启动 Kernel --------
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    batchnorm2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, C, H, W,
+        eps);
+
+    // -------- 转回原 dtype --------
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}

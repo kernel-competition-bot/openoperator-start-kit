@@ -113,65 +113,80 @@ __mlu_entry__ void dilated_conv2d_kernel(
 /* ============================================================================
  * bang_func — 外部调用接口
  *
- * 参数说明 (对应 __init__ 中的定义):
- *   input:       输入张量，形状 [batch, in_channels, H, W]
- *   weight:      卷积核张量，形状 [out_channels, in_channels, kH, kW]
- *   kernel_h:    卷积核高度
- *   kernel_w:    卷积核宽度
- *   stride_h:    步长高度 (默认 1)
- *   stride_w:    步长宽度 (默认 1)
- *   padding_h:   填充高度 (默认 0)
- *   padding_w:   填充宽度 (默认 0)
- *   dilation_h:  空洞系数高度 (默认 1)
- *   dilation_w:  空洞系数宽度 (默认 1)
+ * 严格匹配 C++ Wrapper 签名:
+ *   torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
+ *       int in_channels, int out_channels, int kernel_size,
+ *       int dilation, int padding);
+ *
+ * 内部行为与 PyTorch nn.Conv2d 对齐:
+ *   - stride = 1 (默认)
+ *   - bias = False (无偏置)
+ *   - dilation / padding 为方形参数
+ *   - 空洞卷积输出尺寸公式:
+ *     H_out = (H + 2*pad - dil*(K-1) - 1) / 1 + 1
+ *
+ * 参数:
+ *   x:           输入张量，形状 [batch, in_channels, H, W]
+ *   kernel:      卷积核张量，形状 [out_channels, in_channels, K, K]
+ *   in_channels: 输入通道数
+ *   out_channels:输出通道数
+ *   kernel_size: 卷积核尺寸 K
+ *   dilation:    空洞系数
+ *   padding:     填充宽度
  *
  * 返回值:
  *   卷积输出张量，形状 [batch, out_channels, H_out, W_out]
  * ============================================================================
  */
 torch::Tensor bang_func(
-    torch::Tensor input,
-    torch::Tensor weight,
-    int64_t kernel_h,
-    int64_t kernel_w,
-    int64_t stride_h,
-    int64_t stride_w,
-    int64_t padding_h,
-    int64_t padding_w,
-    int64_t dilation_h,
-    int64_t dilation_w)
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int dilation,
+    int padding)
 {
     // 输入校验
-    TORCH_CHECK(input.is_contiguous(),  "Input must be contiguous");
-    TORCH_CHECK(weight.is_contiguous(), "Weight must be contiguous");
-    TORCH_CHECK(input.dim() == 4,       "Input must be 4D: [N, C, H, W]");
-    TORCH_CHECK(weight.dim() == 4,      "Weight must be 4D: [C_out, C_in, kH, kW]");
+    TORCH_CHECK(x.is_contiguous(),      "Input must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
+    TORCH_CHECK(x.dim() == 4,           "Input must be 4D: [N, C, H, W]");
+    TORCH_CHECK(kernel.dim() == 4,      "Kernel must be 4D: [C_out, C_in, kH, kW]");
 
     // 保留原始 dtype
-    auto original_dtype = input.scalar_type();
+    auto original_dtype = x.scalar_type();
 
     // -------- 统一转为 float32 计算 --------
-    torch::Tensor input_fp32  = input;
-    torch::Tensor weight_fp32 = weight;
+    torch::Tensor x_fp32      = x;
+    torch::Tensor kernel_fp32 = kernel;
     if (original_dtype != torch::kFloat) {
-        input_fp32  = input.to(torch::kFloat);
-        weight_fp32 = weight.to(torch::kFloat);
+        x_fp32      = x.to(torch::kFloat);
+        kernel_fp32 = kernel.to(torch::kFloat);
     }
 
     // 维度信息
-    int N     = (int)input_fp32.size(0);
-    int C_in  = (int)input_fp32.size(1);
-    int H     = (int)input_fp32.size(2);
-    int W     = (int)input_fp32.size(3);
-    int C_out = (int)weight_fp32.size(0);
-    int kH    = (int)weight_fp32.size(2);
-    int kW    = (int)weight_fp32.size(3);
+    int N     = (int)x_fp32.size(0);
+    int C_in  = (int)x_fp32.size(1);
+    int H     = (int)x_fp32.size(2);
+    int W     = (int)x_fp32.size(3);
+    int C_out = (int)kernel_fp32.size(0);
+    int kH    = (int)kernel_fp32.size(2);
+    int kW    = (int)kernel_fp32.size(3);
 
-    // 计算输出尺寸
-    int H_out = (H + 2 * (int)padding_h - (int)dilation_h * (kH - 1) - 1)
-                / (int)stride_h + 1;
-    int W_out = (W + 2 * (int)padding_w - (int)dilation_w * (kW - 1) - 1)
-                / (int)stride_w + 1;
+    // 参数一致性校验
+    TORCH_CHECK(C_in == in_channels,
+                "in_channels ", in_channels, " != input channel ", C_in);
+    TORCH_CHECK(C_out == out_channels,
+                "out_channels ", out_channels, " != kernel out channel ", C_out);
+    TORCH_CHECK(kH == kernel_size && kW == kernel_size,
+                "kernel_size ", kernel_size, " != kernel shape (", kH, ",", kW, ")");
+
+    // PyTorch nn.Conv2d 不指定 stride 时默认为 1
+    const int stride = 1;
+
+    // 计算输出尺寸 (空洞卷积公式)
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
 
     TORCH_CHECK(H_out > 0 && W_out > 0,
                 "Invalid output size: H_out=", H_out, ", W_out=", W_out);
@@ -179,7 +194,7 @@ torch::Tensor bang_func(
     // -------- 分配输出张量 (与输入在同一设备) --------
     auto output_fp32 = torch::empty(
         {N, C_out, H_out, W_out},
-        torch::TensorOptions().dtype(torch::kFloat).device(input_fp32.device()));
+        torch::TensorOptions().dtype(torch::kFloat).device(x_fp32.device()));
 
     // -------- 获取 MLU Stream 并启动 Kernel --------
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
@@ -188,15 +203,15 @@ torch::Tensor bang_func(
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     dilated_conv2d_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        weight_fp32.data_ptr<float>(),
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         N, C_in, H, W,
         C_out, kH, kW,
         H_out, W_out,
-        (int)stride_h, (int)stride_w,
-        (int)padding_h, (int)padding_w,
-        (int)dilation_h, (int)dilation_w);
+        stride, stride,
+        padding, padding,
+        dilation, dilation);
 
     // -------- 转回原 dtype --------
     if (original_dtype != torch::kFloat) {
