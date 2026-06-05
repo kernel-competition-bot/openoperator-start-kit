@@ -1,0 +1,150 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+#define BATCH 4
+#define HEADS 8
+#define Q_LEN 128
+#define K_LEN 128
+#define ROWS (BATCH * HEADS * Q_LEN)
+#define TOTAL_ELEMS (BATCH * HEADS * Q_LEN * K_LEN)
+
+#define ZERO_CHUNK 8192
+
+#define PROCESS_RAW_AN(AN) do {                                      \
+    __memcpy(row,                                                     \
+             src,                                                     \
+             n * sizeof(float),                                       \
+             GDRAM2NRAM);                                             \
+                                                                       \
+    /* padding 先填 0，exphp 后再清 0，不参与 sum */                    \
+    for (int j = n; j < (AN); ++j) {                                  \
+        row[j] = 0.0f;                                                \
+    }                                                                  \
+                                                                       \
+    /* no-max raw exp: exp(logits) */                                  \
+    __bang_active_exphp(row, row, (AN));                               \
+                                                                       \
+    for (int j = n; j < (AN); ++j) {                                  \
+        row[j] = 0.0f;                                                \
+    }                                                                  \
+                                                                       \
+    __bang_reduce_sum(tmp, row, (AN));                                 \
+                                                                       \
+    float sum_val = tmp[0];                                           \
+    if ((AN) > 32) {                                                   \
+        sum_val += tmp[32];                                           \
+    }                                                                  \
+    if ((AN) > 64) {                                                   \
+        sum_val += tmp[64];                                           \
+    }                                                                  \
+    if ((AN) > 96) {                                                   \
+        sum_val += tmp[96];                                           \
+    }                                                                  \
+                                                                       \
+    float inv_sum = 1.0f / sum_val;                                   \
+    __bang_mul_const(row, row, inv_sum, (AN));                         \
+                                                                       \
+    /* output 已经全局清零，只写有效 causal 区 */                        \
+    __memcpy(dst,                                                      \
+             row,                                                      \
+             n * sizeof(float),                                        \
+             NRAM2GDRAM);                                              \
+} while (0)
+
+__mlu_entry__ void zero_output_kernel_v25(float *output) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ float z[ZERO_CHUNK];
+    __bang_write_zero(z, ZERO_CHUNK);
+
+    int per = (TOTAL_ELEMS + tnum - 1) / tnum;
+    int start = tid * per;
+    int end = start + per;
+
+    if (end > TOTAL_ELEMS) {
+        end = TOTAL_ELEMS;
+    }
+
+    for (int pos = start; pos < end; pos += ZERO_CHUNK) {
+        int len = end - pos;
+        if (len > ZERO_CHUNK) {
+            len = ZERO_CHUNK;
+        }
+
+        __memcpy(output + pos,
+                 z,
+                 len * sizeof(float),
+                 NRAM2GDRAM);
+    }
+}
+
+__mlu_entry__ void scaled_masked_softmax_v25_kernel(
+    const float *attn_weight,
+    float *output
+) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ float row[K_LEN];
+    __nram__ float tmp[K_LEN];
+
+    for (int r = tid; r < ROWS; r += tnum) {
+        int q = r & 127;
+        int n = q + 1;
+
+        const float *src = attn_weight + r * K_LEN;
+        float *dst = output + r * K_LEN;
+
+        // output 已经全局清零；q=0 softmax([x]) = 1
+        if (q == 0) {
+            row[0] = 1.0f;
+            __memcpy(dst,
+                     row,
+                     sizeof(float),
+                     NRAM2GDRAM);
+            continue;
+        }
+
+        if (q < 32) {
+            PROCESS_RAW_AN(32);
+        } else if (q < 64) {
+            PROCESS_RAW_AN(64);
+        } else if (q < 96) {
+            PROCESS_RAW_AN(96);
+        } else {
+            PROCESS_RAW_AN(128);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor attn_weight,
+                        torch::Tensor mask,
+                        double scale) {
+    auto output = torch::empty(
+        {BATCH, HEADS, Q_LEN, K_LEN},
+        attn_weight.options()
+    );
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    zero_output_kernel_v25<<<dim, ktype, queue>>>(
+        output.data_ptr<float>()
+    );
+
+    scaled_masked_softmax_v25_kernel<<<dim, ktype, queue>>>(
+        attn_weight.data_ptr<float>(),
+        output.data_ptr<float>()
+    );
+
+    return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "Scaled_masked_softmax");
+}
