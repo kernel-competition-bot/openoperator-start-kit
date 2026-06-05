@@ -1,0 +1,128 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define TASK_NUM 4
+
+__mlu_entry__ void gather_weighted_float_kernel(
+    float* x,
+    int* indices,
+    int* bin_ids,
+    float* weights,
+    int* bins,
+    float* output,
+    int tokens,
+    int hidden_size,
+    int num_elements,
+    int top_k,
+    int has_weights
+) {
+    int total = num_elements * hidden_size;
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    for (int linear = core_id; linear < total; linear += core_num) {
+        int pid = linear / hidden_size;
+        int h = linear - pid * hidden_size;
+
+        int index = indices[pid];
+        int bin_id = bin_ids[pid];
+
+        int bin_start = 0;
+        if (bin_id > 0) {
+            bin_start = bins[bin_id - 1];
+        }
+
+        int offset_in_bin = pid - bin_start;
+        int index_b = offset_in_bin + bin_start;
+
+        int src_row = index / top_k;
+
+        float value = x[src_row * hidden_size + h];
+
+        if (has_weights) {
+            value *= weights[index];
+        }
+
+        output[index_b * hidden_size + h] = value;
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor indices,
+    torch::Tensor bin_ids,
+    torch::Tensor weights,
+    torch::Tensor bins,
+    int top_k
+) {
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(indices.dim() == 1, "indices must be 1D");
+    TORCH_CHECK(bin_ids.dim() == 1, "bin_ids must be 1D");
+    TORCH_CHECK(bins.dim() == 1, "bins must be 1D");
+    TORCH_CHECK(indices.numel() == bin_ids.numel(), "indices and bin_ids size mismatch");
+    TORCH_CHECK(top_k > 0, "top_k must be positive");
+
+    int tokens = x.size(0);
+    int hidden_size = x.size(1);
+    int num_elements = indices.numel();
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x.contiguous();
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x_fp32.to(torch::kFloat);
+    }
+
+    torch::Tensor weights_fp32 = weights;
+    int has_weights = 0;
+
+    if (weights.defined() && weights.numel() > 0) {
+        has_weights = 1;
+        weights_fp32 = weights.contiguous();
+        if (weights_fp32.scalar_type() != torch::kFloat) {
+            weights_fp32 = weights_fp32.to(torch::kFloat);
+        }
+    } else {
+        weights_fp32 = torch::empty({1}, x_fp32.options());
+    }
+
+    auto indices_i32 = indices.contiguous();
+    auto bin_ids_i32 = bin_ids.contiguous();
+    auto bins_i32 = bins.contiguous();
+
+    TORCH_CHECK(indices_i32.scalar_type() == torch::kInt32, "indices must be int32");
+    TORCH_CHECK(bin_ids_i32.scalar_type() == torch::kInt32, "bin_ids must be int32");
+    TORCH_CHECK(bins_i32.scalar_type() == torch::kInt32, "bins must be int32");
+
+    auto output_fp32 = torch::zeros(
+        {tokens * top_k, hidden_size},
+        x_fp32.options()
+    );
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    gather_weighted_float_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        indices_i32.data_ptr<int>(),
+        bin_ids_i32.data_ptr<int>(),
+        weights_fp32.data_ptr<float>(),
+        bins_i32.data_ptr<int>(),
+        output_fp32.data_ptr<float>(),
+        tokens,
+        hidden_size,
+        num_elements,
+        top_k,
+        has_weights
+    );
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
