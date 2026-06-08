@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define BLOCK_SIZE 256
+#define BLOCK_SIZE 1024
 
 __mlu_entry__ void sqrt_kernel(half *input, half *output, int total) {
     uint32_t task_id = taskId;
@@ -19,6 +19,11 @@ __mlu_entry__ void sqrt_kernel(half *input, half *output, int total) {
         uint32_t aligned_len = (len + 63) & ~63;
 
         __memcpy(buffer, input + offset, len * sizeof(half), GDRAM2NRAM);
+        if (aligned_len > len) {
+            for (uint32_t i = len; i < aligned_len; ++i) {
+                buffer[i] = (half)0.0f;
+            }
+        }
         __bang_abs(buffer, buffer, aligned_len);
         __bang_half2float(float_buffer, buffer, aligned_len);
         __bang_sqrt(float_buffer, float_buffer, aligned_len);
@@ -35,7 +40,7 @@ torch::Tensor bang_func(torch::Tensor input) {
     int total = input.numel();
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     sqrt_kernel<<<dim, ktype, queue>>>(

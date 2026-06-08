@@ -4,8 +4,7 @@
 #include <vector>
 
 #define BLOCK_SIZE 1024
-#define K_MAX 128
-#define TASKS 16
+#define K_MAX 16
 
 __mlu_entry__ void topk_dim1_kernel(const half *x, half *values, int64_t *indices,
                                     int batch, int cols, int k) {
@@ -14,28 +13,35 @@ __mlu_entry__ void topk_dim1_kernel(const half *x, half *values, int64_t *indice
         return;
     }
 
-    __nram__ half row_buf[BLOCK_SIZE];
     __nram__ half top_vals[K_MAX];
     __nram__ int top_idx[K_MAX];
 
     const half *row_ptr = x + row * cols;
-    __memcpy(row_buf, row_ptr, cols * sizeof(half), GDRAM2NRAM);
 
     for (int i = 0; i < k; ++i) {
-        half best = row_buf[0];
-        int best_idx = 0;
+        top_vals[i] = (half)-65504.0f;
+        top_idx[i] = -1;
+    }
 
-        for (int j = 1; j < cols; ++j) {
-            half cur = row_buf[j];
-            if (cur > best || (cur == best && j < best_idx)) {
-                best = cur;
-                best_idx = j;
+    for (int j = 0; j < cols; ++j) {
+        half cur = row_ptr[j];
+        int insert_pos = -1;
+
+        for (int i = 0; i < k; ++i) {
+            if (cur > top_vals[i] || (cur == top_vals[i] && j < top_idx[i])) {
+                insert_pos = i;
+                break;
             }
         }
 
-        top_vals[i] = best;
-        top_idx[i] = best_idx;
-        row_buf[best_idx] = (half)-65504.0f;
+        if (insert_pos >= 0) {
+            for (int i = k - 1; i > insert_pos; --i) {
+                top_vals[i] = top_vals[i - 1];
+                top_idx[i] = top_idx[i - 1];
+            }
+            top_vals[insert_pos] = cur;
+            top_idx[insert_pos] = j;
+        }
     }
 
     __memcpy(values + row * k, top_vals, k * sizeof(half), NRAM2GDRAM);
