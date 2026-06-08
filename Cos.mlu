@@ -1,24 +1,20 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "framework/core/MLUStream.h"
 
 #define CHUNK_SIZE 4096
 
 __mlu_entry__ void cos_kernel(
     float *input,
     float *output,
-    int total) {
-
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total / core_num;
-    uint32_t remainder = total % core_num;
-
-    uint32_t start = core_id * per_core +
-                     (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core +
-                     (core_id < remainder ? 1 : 0);
+    int total)
+{
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+    uint32_t per_task = total / task_num;
+    uint32_t rem = total % task_num;
+    uint32_t start = task_id * per_task + (task_id < rem ? task_id : rem);
+    uint32_t count = per_task + (task_id < rem ? 1 : 0);
 
     __nram__ float nram_in[CHUNK_SIZE];
     __nram__ float nram_out[CHUNK_SIZE];
@@ -35,32 +31,37 @@ __mlu_entry__ void cos_kernel(
     }
 }
 
-
-torch::Tensor bang_func(torch::Tensor x) {
+torch::Tensor bang_func(torch::Tensor x)
+{
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
 
-    // 转换为 float 类型
-    torch::Tensor x_fp32 = (x.scalar_type() == torch::kFloat) ? x : x.to(torch::kFloat);
+    auto original_dtype = x.scalar_type();
 
-    auto output = torch::empty_like(x_fp32);
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty_like(x_fp32);
 
     int total = x_fp32.numel();
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};          // 使用 4 个计算核
+
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     cos_kernel<<<dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
         total
     );
 
-    // 如果原始输入不是 float，将结果转换回原类型
-    if (x.scalar_type() != torch::kFloat) {
-        output = output.to(x.scalar_type());
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
     }
-    return output;
+
+    return output_fp32;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
