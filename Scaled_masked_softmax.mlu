@@ -145,6 +145,3 @@ torch::Tensor bang_func(torch::Tensor attn_weight,
     return output;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_func", &bang_func, "Scaled_masked_softmax");
-}
