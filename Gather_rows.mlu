@@ -1,5 +1,7 @@
-// 110_Gather_rows v110_13_fullunroll8_half_port
+// 110_Gather_rows v110_14_allcopy_half_fullunroll8_t1
 // submission version: no PYBIND11_MODULE
+
+#warning "BUILD_VERSION v110_14_allcopy_half_fullunroll8_t1"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -16,7 +18,11 @@
 #define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
 
-#define DO_GATHER(K) do {                                      \
+#define TOTAL_INPUT_ELEMS  (BATCH * N_COL)
+#define TOTAL_INDEX_ELEMS  (BATCH * K_COL)
+#define TOTAL_OUTPUT_ELEMS (BATCH * K_COL)
+
+#define DO_GATHER_BLOCK(K) do {                                \
     int c0 = (int)idx_buf[(K)];                                \
     int c1 = (int)idx_buf[32 + (K)];                           \
     int c2 = (int)idx_buf[64 + (K)];                           \
@@ -35,15 +41,45 @@
     out_buf[224 + (K)] = input_buf[7168 + c7];                 \
 } while (0)
 
-#define DO_ALL_GATHER() do { \
-    DO_GATHER(0);  DO_GATHER(1);  DO_GATHER(2);  DO_GATHER(3);  \
-    DO_GATHER(4);  DO_GATHER(5);  DO_GATHER(6);  DO_GATHER(7);  \
-    DO_GATHER(8);  DO_GATHER(9);  DO_GATHER(10); DO_GATHER(11); \
-    DO_GATHER(12); DO_GATHER(13); DO_GATHER(14); DO_GATHER(15); \
-    DO_GATHER(16); DO_GATHER(17); DO_GATHER(18); DO_GATHER(19); \
-    DO_GATHER(20); DO_GATHER(21); DO_GATHER(22); DO_GATHER(23); \
-    DO_GATHER(24); DO_GATHER(25); DO_GATHER(26); DO_GATHER(27); \
-    DO_GATHER(28); DO_GATHER(29); DO_GATHER(30); DO_GATHER(31); \
+#define DO_ALL_GATHER_BLOCK() do { \
+    DO_GATHER_BLOCK(0);  DO_GATHER_BLOCK(1);  DO_GATHER_BLOCK(2);  DO_GATHER_BLOCK(3);  \
+    DO_GATHER_BLOCK(4);  DO_GATHER_BLOCK(5);  DO_GATHER_BLOCK(6);  DO_GATHER_BLOCK(7);  \
+    DO_GATHER_BLOCK(8);  DO_GATHER_BLOCK(9);  DO_GATHER_BLOCK(10); DO_GATHER_BLOCK(11); \
+    DO_GATHER_BLOCK(12); DO_GATHER_BLOCK(13); DO_GATHER_BLOCK(14); DO_GATHER_BLOCK(15); \
+    DO_GATHER_BLOCK(16); DO_GATHER_BLOCK(17); DO_GATHER_BLOCK(18); DO_GATHER_BLOCK(19); \
+    DO_GATHER_BLOCK(20); DO_GATHER_BLOCK(21); DO_GATHER_BLOCK(22); DO_GATHER_BLOCK(23); \
+    DO_GATHER_BLOCK(24); DO_GATHER_BLOCK(25); DO_GATHER_BLOCK(26); DO_GATHER_BLOCK(27); \
+    DO_GATHER_BLOCK(28); DO_GATHER_BLOCK(29); DO_GATHER_BLOCK(30); DO_GATHER_BLOCK(31); \
+} while (0)
+
+#define DO_GATHER_ALLCOPY(K) do {                                      \
+    int c0 = (int)idx_all[idx_base + (K)];                              \
+    int c1 = (int)idx_all[idx_base + 32 + (K)];                         \
+    int c2 = (int)idx_all[idx_base + 64 + (K)];                         \
+    int c3 = (int)idx_all[idx_base + 96 + (K)];                         \
+    int c4 = (int)idx_all[idx_base + 128 + (K)];                        \
+    int c5 = (int)idx_all[idx_base + 160 + (K)];                        \
+    int c6 = (int)idx_all[idx_base + 192 + (K)];                        \
+    int c7 = (int)idx_all[idx_base + 224 + (K)];                        \
+    out_all[out_base + (K)]       = input_all[input_base + c0];          \
+    out_all[out_base + 32 + (K)]  = input_all[input_base + 1024 + c1];   \
+    out_all[out_base + 64 + (K)]  = input_all[input_base + 2048 + c2];   \
+    out_all[out_base + 96 + (K)]  = input_all[input_base + 3072 + c3];   \
+    out_all[out_base + 128 + (K)] = input_all[input_base + 4096 + c4];   \
+    out_all[out_base + 160 + (K)] = input_all[input_base + 5120 + c5];   \
+    out_all[out_base + 192 + (K)] = input_all[input_base + 6144 + c6];   \
+    out_all[out_base + 224 + (K)] = input_all[input_base + 7168 + c7];   \
+} while (0)
+
+#define DO_ALL_GATHER_ALLCOPY() do { \
+    DO_GATHER_ALLCOPY(0);  DO_GATHER_ALLCOPY(1);  DO_GATHER_ALLCOPY(2);  DO_GATHER_ALLCOPY(3);  \
+    DO_GATHER_ALLCOPY(4);  DO_GATHER_ALLCOPY(5);  DO_GATHER_ALLCOPY(6);  DO_GATHER_ALLCOPY(7);  \
+    DO_GATHER_ALLCOPY(8);  DO_GATHER_ALLCOPY(9);  DO_GATHER_ALLCOPY(10); DO_GATHER_ALLCOPY(11); \
+    DO_GATHER_ALLCOPY(12); DO_GATHER_ALLCOPY(13); DO_GATHER_ALLCOPY(14); DO_GATHER_ALLCOPY(15); \
+    DO_GATHER_ALLCOPY(16); DO_GATHER_ALLCOPY(17); DO_GATHER_ALLCOPY(18); DO_GATHER_ALLCOPY(19); \
+    DO_GATHER_ALLCOPY(20); DO_GATHER_ALLCOPY(21); DO_GATHER_ALLCOPY(22); DO_GATHER_ALLCOPY(23); \
+    DO_GATHER_ALLCOPY(24); DO_GATHER_ALLCOPY(25); DO_GATHER_ALLCOPY(26); DO_GATHER_ALLCOPY(27); \
+    DO_GATHER_ALLCOPY(28); DO_GATHER_ALLCOPY(29); DO_GATHER_ALLCOPY(30); DO_GATHER_ALLCOPY(31); \
 } while (0)
 
 __mlu_entry__ void gather_rows_block8_full_unroll_float_kernel(
@@ -77,7 +113,7 @@ __mlu_entry__ void gather_rows_block8_full_unroll_float_kernel(
                  INDEX_BLOCK_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        DO_ALL_GATHER();
+        DO_ALL_GATHER_BLOCK();
 
         __memcpy(out_ptr,
                  out_buf,
@@ -86,44 +122,43 @@ __mlu_entry__ void gather_rows_block8_full_unroll_float_kernel(
     }
 }
 
-__mlu_entry__ void gather_rows_block8_full_unroll_half_kernel(
+__mlu_entry__ void gather_rows_allcopy_full_unroll_half_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
     uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
 
-    __nram__ half input_buf[INPUT_BLOCK_ELEMS];
-    __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
-    __nram__ half out_buf[OUTPUT_BLOCK_ELEMS];
-
-    int num_blocks = BATCH / ROW_BLOCK;
-
-    for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
-
-        const half *input_ptr = input + b0 * N_COL;
-        const int64_t *idx_ptr = index + b0 * K_COL;
-        half *out_ptr = output + b0 * K_COL;
-
-        __memcpy(input_buf,
-                 input_ptr,
-                 INPUT_BLOCK_ELEMS * sizeof(half),
-                 GDRAM2NRAM);
-
-        __memcpy(idx_buf,
-                 idx_ptr,
-                 INDEX_BLOCK_ELEMS * sizeof(int64_t),
-                 GDRAM2NRAM);
-
-        DO_ALL_GATHER();
-
-        __memcpy(out_ptr,
-                 out_buf,
-                 OUTPUT_BLOCK_ELEMS * sizeof(half),
-                 NRAM2GDRAM);
+    if (tid != 0) {
+        return;
     }
+
+    __nram__ half input_all[TOTAL_INPUT_ELEMS];
+    __nram__ int64_t idx_all[TOTAL_INDEX_ELEMS];
+    __nram__ half out_all[TOTAL_OUTPUT_ELEMS];
+
+    __memcpy(input_all,
+             input,
+             TOTAL_INPUT_ELEMS * sizeof(half),
+             GDRAM2NRAM);
+
+    __memcpy(idx_all,
+             index,
+             TOTAL_INDEX_ELEMS * sizeof(int64_t),
+             GDRAM2NRAM);
+
+    for (int blk = 0; blk < BATCH / ROW_BLOCK; ++blk) {
+        int input_base = blk * INPUT_BLOCK_ELEMS;
+        int idx_base = blk * INDEX_BLOCK_ELEMS;
+        int out_base = blk * OUTPUT_BLOCK_ELEMS;
+
+        DO_ALL_GATHER_ALLCOPY();
+    }
+
+    __memcpy(output,
+             out_all,
+             TOTAL_OUTPUT_ELEMS * sizeof(half),
+             NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
@@ -131,22 +166,26 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_block8_full_unroll_half_kernel<<<dim, ktype, queue>>>(
+        cnrtDim3_t dim_half = {1, 1, 1};
+
+        gather_rows_allcopy_full_unroll_half_kernel<<<dim_half, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
-    } else {
-        gather_rows_block8_full_unroll_float_kernel<<<dim, ktype, queue>>>(
+    } else if (input.scalar_type() == torch::kFloat32) {
+        cnrtDim3_t dim_float = {4, 1, 1};
+
+        gather_rows_block8_full_unroll_float_kernel<<<dim_float, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
         );
+    } else {
+        TORCH_CHECK(false, "v110_14 supports only float16/float32 input");
     }
 
     return output;
