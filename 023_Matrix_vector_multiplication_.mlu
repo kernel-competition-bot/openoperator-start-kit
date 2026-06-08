@@ -1,0 +1,87 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+#define CHUNK_SIZE 4096
+#define CORE_NUM 4
+
+__mlu_entry__ void gemv_kernel(
+    float* A,
+    float* B,
+    float* C,
+    int M,
+    int K) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core_rows = M / core_num;
+    uint32_t remainder = M % core_num;
+    uint32_t start_row = core_id * per_core_rows + (core_id < remainder ? core_id : remainder);
+    uint32_t rows = per_core_rows + (core_id < remainder ? 1 : 0);
+
+    __nram__ float a_chunk[CHUNK_SIZE];
+    __nram__ float b_chunk[CHUNK_SIZE];
+    __nram__ float mul_chunk[CHUNK_SIZE];
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        uint32_t row_idx = start_row + r;
+        float local_sum = 0.0f;
+
+        for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
+            uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
+            uint32_t aligned_len = (len + 63) & ~63;
+
+            __memcpy(a_chunk, A + row_idx * K + offset, len * sizeof(float), GDRAM2NRAM);
+            __memcpy(b_chunk, B + offset, len * sizeof(float), GDRAM2NRAM);
+
+            __bang_mul(mul_chunk, a_chunk, b_chunk, aligned_len);
+
+            for (uint32_t i = 0; i < len; ++i) {
+                local_sum += mul_chunk[i];
+            }
+        }
+        C[row_idx] = local_sum;
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor A,
+    torch::Tensor B) {
+
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D tensor");
+    TORCH_CHECK(B.dim() == 2, "B must be 2D tensor");
+    TORCH_CHECK(B.size(1) == 1, "B must have shape [K, 1]");
+
+    int M = A.size(0);
+    int K = A.size(1);
+    TORCH_CHECK(B.size(0) == K, "B size(0) must match A size(1)");
+
+    auto original_dtype = A.scalar_type();
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+        B_fp32 = B.to(torch::kFloat);
+    }
+
+    auto C = torch::empty({M, 1}, torch::TensorOptions().dtype(torch::kFloat).device(A_fp32.device()));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {CORE_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    gemv_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C.data_ptr<float>(),
+        M, K);
+
+    return C;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "Matrix-Vector Multiplication (GEMV)");
+}
