@@ -68,7 +68,7 @@ std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
     auto indices = torch::empty({batch, k}, x.options().dtype(torch::kInt64));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t task_dim = {batch, 1, 1};
+    cnrtDim3_t task_dim = {static_cast<unsigned int>(batch), 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     topk_dim1_kernel<<<task_dim, ktype, queue>>>(
