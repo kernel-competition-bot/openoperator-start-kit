@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_33_split_allcopy_half_idx32_t1
+// 110_Gather_rows v110_34_discrete_gather_block8_store64_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_33_split_allcopy_half_idx32_t1"
+#warning "BUILD_VERSION v110_34_discrete_gather_block8_store64_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,70 +12,74 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-
-#define TOTAL_INPUT_ELEMS  (BATCH * N_COL)
-#define TOTAL_INDEX_ELEMS  (BATCH * K_COL)
-#define TOTAL_OUTPUT_ELEMS (BATCH * K_COL)
-
-#define HALF_COPY_ELEMS    (TOTAL_INPUT_ELEMS / 2)
-
 #define ROW_BLOCK 8
-#define TASK_DIM_FLOAT 4
+#define TASK_DIM 4
+
 #define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
 
-__mlu_entry__ void gather_rows_split_allcopy_half_idx32_kernel(
+// half: 256 half = 512B = 64 uint64
+#define HALF_STORE64_ELEMS 64
+
+// float: 256 float = 1024B = 128 uint64
+#define FLOAT_STORE64_ELEMS 128
+
+__mlu_entry__ void gather_rows_discrete_half_store64_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
     uint32_t tid = taskId;
-    if (tid != 0) {
-        return;
-    }
+    uint32_t tnum = taskDim;
 
-    __nram__ half input_buf[TOTAL_INPUT_ELEMS];
-    __nram__ int64_t raw_idx64[TOTAL_INDEX_ELEMS];
-    __nram__ int32_t idx32[TOTAL_INDEX_ELEMS];
-    __nram__ half out_buf[TOTAL_OUTPUT_ELEMS];
+    __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
+    __nram__ unsigned short off_buf[INDEX_BLOCK_ELEMS];
+    __nram__ half out_buf[OUTPUT_BLOCK_ELEMS];
 
-    __memcpy(input_buf,
-             input,
-             HALF_COPY_ELEMS * sizeof(half),
-             GDRAM2NRAM);
+    int num_blocks = BATCH / ROW_BLOCK;
 
-    __memcpy(input_buf + HALF_COPY_ELEMS,
-             input + HALF_COPY_ELEMS,
-             HALF_COPY_ELEMS * sizeof(half),
-             GDRAM2NRAM);
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
 
-    __memcpy(raw_idx64,
-             index,
-             TOTAL_INDEX_ELEMS * sizeof(int64_t),
-             GDRAM2NRAM);
+        const half *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        half *out_ptr = output + b0 * K_COL;
 
-    for (int i = 0; i < TOTAL_INDEX_ELEMS; ++i) {
-        idx32[i] = (int32_t)raw_idx64[i];
-    }
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_BLOCK_ELEMS * sizeof(int64_t),
+                 GDRAM2NRAM);
 
-    for (int b = 0; b < BATCH; ++b) {
-        int in_base = b * N_COL;
-        int idx_base = b * K_COL;
-        int out_base = b * K_COL;
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
 
-        for (int k = 0; k < K_COL; ++k) {
-            int idx = idx32[idx_base + k];
-            out_buf[out_base + k] = input_buf[in_base + idx];
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(half));
+            }
+        }
+
+        __gather(out_buf,
+                 input_ptr,
+                 off_buf,
+                 sizeof(half),
+                 GDRAM2NRAM,
+                 sizeof(half),
+                 OUTPUT_BLOCK_ELEMS);
+
+        uint64_t *src64 = (uint64_t *)out_buf;
+        uint64_t *dst64 = (uint64_t *)out_ptr;
+
+        for (int i = 0; i < HALF_STORE64_ELEMS; ++i) {
+            uint64_t v = src64[i];
+            __store_gdram(dst64 + i, v);
         }
     }
-
-    __memcpy(output,
-             out_buf,
-             TOTAL_OUTPUT_ELEMS * sizeof(half),
-             NRAM2GDRAM);
 }
 
-__mlu_entry__ void gather_rows_discrete_gather_float_kernel(
+__mlu_entry__ void gather_rows_discrete_float_store64_kernel(
     const float *input,
     const int64_t *index,
     float *output
@@ -120,10 +124,13 @@ __mlu_entry__ void gather_rows_discrete_gather_float_kernel(
                  sizeof(float),
                  OUTPUT_BLOCK_ELEMS);
 
-        __memcpy(out_ptr,
-                 out_buf,
-                 OUTPUT_BLOCK_ELEMS * sizeof(float),
-                 NRAM2GDRAM);
+        uint64_t *src64 = (uint64_t *)out_buf;
+        uint64_t *dst64 = (uint64_t *)out_ptr;
+
+        for (int i = 0; i < FLOAT_STORE64_ELEMS; ++i) {
+            uint64_t v = src64[i];
+            __store_gdram(dst64 + i, v);
+        }
     }
 }
 
@@ -132,26 +139,24 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {TASK_DIM, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        cnrtDim3_t dim = {1, 1, 1};
-
-        gather_rows_split_allcopy_half_idx32_kernel<<<dim, ktype, queue>>>(
+        gather_rows_discrete_half_store64_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else if (input.scalar_type() == torch::kFloat32) {
-        cnrtDim3_t dim = {TASK_DIM_FLOAT, 1, 1};
-
-        gather_rows_discrete_gather_float_kernel<<<dim, ktype, queue>>>(
+        gather_rows_discrete_float_store64_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
         );
     } else {
-        TORCH_CHECK(false, "v110_33 supports only float16/float32 input");
+        TORCH_CHECK(false, "v110_34 supports only float16/float32 input");
     }
 
     return output;
