@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_34_discrete_gather_half_block32_u16_t2
+// 110_Gather_rows v110_35_discrete_gather_half_block16_u16idx32_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_34_discrete_gather_half_block32_u16_t2"
+#warning "BUILD_VERSION v110_35_discrete_gather_half_block16_u16idx32_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -13,8 +13,8 @@
 #define N_COL 1024
 #define K_COL 32
 
-#define ROW_BLOCK_H 32
-#define TASK_DIM_H 2
+#define ROW_BLOCK_H 16
+#define TASK_DIM_H 4
 
 #define H_INDEX_ELEMS  (ROW_BLOCK_H * K_COL)
 #define H_OUTPUT_ELEMS (ROW_BLOCK_H * K_COL)
@@ -25,7 +25,7 @@
 #define F_INDEX_ELEMS  (ROW_BLOCK_F * K_COL)
 #define F_OUTPUT_ELEMS (ROW_BLOCK_F * K_COL)
 
-__mlu_entry__ void gather_rows_half_block32_u16_kernel(
+__mlu_entry__ void gather_rows_half_block16_u16idx32_kernel(
     const half *input,
     const int64_t *index,
     half *output
@@ -33,11 +33,12 @@ __mlu_entry__ void gather_rows_half_block32_u16_kernel(
     uint32_t tid = taskId;
     uint32_t tnum = taskDim;
 
-    __nram__ int64_t idx_buf[H_INDEX_ELEMS];
+    // 实际复制的是 int64 index 原始字节，但按 int32 低位读取
+    __nram__ int32_t idx32_buf[H_INDEX_ELEMS * 2];
     __nram__ unsigned short off_buf[H_OUTPUT_ELEMS];
     __nram__ half out_buf[H_OUTPUT_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK_H;  // 2
+    int num_blocks = BATCH / ROW_BLOCK_H;  // 4
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
         int b0 = blk * ROW_BLOCK_H;
@@ -46,19 +47,22 @@ __mlu_entry__ void gather_rows_half_block32_u16_kernel(
         const int64_t *idx_ptr = index + b0 * K_COL;
         half *out_ptr = output + b0 * K_COL;
 
-        __memcpy(idx_buf,
+        __memcpy(idx32_buf,
                  idx_ptr,
                  H_INDEX_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
+#pragma unroll
         for (int r = 0; r < ROW_BLOCK_H; ++r) {
             int row_base_elem = r * N_COL;
             int idx_base = r * K_COL;
 
+#pragma unroll
             for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
+                int idx = idx32_buf[(idx_base + k) * 2];
 
-                // half block32 最大 byte offset = 65534，刚好 fits uint16
+                // half block16 最大 byte offset:
+                // (15 * 1024 + 1023) * 2 = 32766
                 off_buf[idx_base + k] =
                     (unsigned short)((row_base_elem + idx) * sizeof(half));
             }
@@ -79,7 +83,7 @@ __mlu_entry__ void gather_rows_half_block32_u16_kernel(
     }
 }
 
-__mlu_entry__ void gather_rows_float_block8_u16_kernel(
+__mlu_entry__ void gather_rows_float_block8_u16idx32_kernel(
     const float *input,
     const int64_t *index,
     float *output
@@ -87,7 +91,7 @@ __mlu_entry__ void gather_rows_float_block8_u16_kernel(
     uint32_t tid = taskId;
     uint32_t tnum = taskDim;
 
-    __nram__ int64_t idx_buf[F_INDEX_ELEMS];
+    __nram__ int32_t idx32_buf[F_INDEX_ELEMS * 2];
     __nram__ unsigned short off_buf[F_OUTPUT_ELEMS];
     __nram__ float out_buf[F_OUTPUT_ELEMS];
 
@@ -100,17 +104,20 @@ __mlu_entry__ void gather_rows_float_block8_u16_kernel(
         const int64_t *idx_ptr = index + b0 * K_COL;
         float *out_ptr = output + b0 * K_COL;
 
-        __memcpy(idx_buf,
+        __memcpy(idx32_buf,
                  idx_ptr,
                  F_INDEX_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
+#pragma unroll
         for (int r = 0; r < ROW_BLOCK_F; ++r) {
             int row_base_elem = r * N_COL;
             int idx_base = r * K_COL;
 
+#pragma unroll
             for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
+                int idx = idx32_buf[(idx_base + k) * 2];
+
                 off_buf[idx_base + k] =
                     (unsigned short)((row_base_elem + idx) * sizeof(float));
             }
@@ -141,7 +148,7 @@ torch::Tensor bang_func(torch::Tensor input,
     if (input.scalar_type() == torch::kHalf) {
         cnrtDim3_t dim = {TASK_DIM_H, 1, 1};
 
-        gather_rows_half_block32_u16_kernel<<<dim, ktype, queue>>>(
+        gather_rows_half_block16_u16idx32_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
@@ -149,7 +156,7 @@ torch::Tensor bang_func(torch::Tensor input,
     } else {
         cnrtDim3_t dim = {TASK_DIM_F, 1, 1};
 
-        gather_rows_float_block8_u16_kernel<<<dim, ktype, queue>>>(
+        gather_rows_float_block8_u16idx32_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
