@@ -5,7 +5,7 @@
 #define ROWS 128
 #define COLS 4000
 #define CHUNK_SIZE 4096
-#define TASK_NUM 128
+#define TASK_NUM 16
 
 __mlu_entry__ void cumsum_dim1_float_kernel(
     float* input,
@@ -28,12 +28,16 @@ __mlu_entry__ void cumsum_dim1_float_kernel(
             GDRAM2NRAM
         );
 
-        float acc = 0.0f;
+ 
+        float sum = 0.0f;
+        float c = 0.0f;
 
-        // 顺序累加，尽量贴近 torch.cumsum 的 running sum 语义
         for (int col = 0; col < cols; ++col) {
-            acc = acc + buf[col];
-            buf[col] = acc;
+            float y = buf[col] - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
+            buf[col] = sum;
         }
 
         __memcpy(
@@ -66,11 +70,19 @@ __mlu_entry__ void cumsum_dim1_half_kernel(
             GDRAM2NRAM
         );
 
-        half acc = (half)0.0f;
+      
+        float sum = 0.0f;
+        float c = 0.0f;
 
         for (int col = 0; col < cols; ++col) {
-            acc = acc + buf[col];
-            buf[col] = acc;
+            float x = (float)buf[col];
+
+            float y = x - c;
+            float t = sum + y;
+            c = (t - sum) - y;
+            sum = t;
+
+            buf[col] = (half)sum;
         }
 
         __memcpy(
@@ -99,14 +111,14 @@ torch::Tensor bang_func(
     cnrtDim3_t k_dim = {TASK_NUM, 1, 1};
     cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
 
-    if (x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat) {
+    if (x.scalar_type() == torch::kFloat || x.scalar_type() == torch::kFloat32) {
         cumsum_dim1_float_kernel<<<k_dim, k_type, queue>>>(
             x.data_ptr<float>(),
             output.data_ptr<float>(),
             ROWS,
             COLS
         );
-    } else if (x.scalar_type() == torch::kFloat16 || x.scalar_type() == torch::kHalf) {
+    } else if (x.scalar_type() == torch::kHalf || x.scalar_type() == torch::kFloat16) {
         cumsum_dim1_half_kernel<<<k_dim, k_type, queue>>>(
             reinterpret_cast<half*>(x.data_ptr<at::Half>()),
             reinterpret_cast<half*>(output.data_ptr<at::Half>()),
