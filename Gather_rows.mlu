@@ -1,164 +1,17 @@
-// 110_Gather_rows v110_48_viewout_inplace_gather_block8_t4
+// 110_Gather_rows v110_50_probe_Pa_empty_only
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_48_viewout_inplace_gather_block8_t4"
+#warning "BUILD_VERSION v110_50_probe_Pa_empty_only"
 
-#include <bang.h>
 #include <torch/extension.h>
-#include <cnrt.h>
 #include <stdint.h>
-#include "framework/core/MLUStream.h"
 
 #define BATCH 64
-#define N_COL 1024
 #define K_COL 32
-
-#define ROW_BLOCK 8
-#define TASK_DIM 4
-
-#define INDEX_ELEMS  (ROW_BLOCK * K_COL)
-#define OUTPUT_ELEMS (ROW_BLOCK * K_COL)
-
-__mlu_entry__ void gather_rows_half_viewout_kernel(
-    half *input,
-    const int64_t *index
-) {
-    uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
-
-    __nram__ int64_t idx_buf[INDEX_ELEMS];
-    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
-    __nram__ half out_buf[OUTPUT_ELEMS];
-
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
-
-    for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
-
-        half *input_ptr = input + b0 * N_COL;
-        const int64_t *idx_ptr = index + b0 * K_COL;
-
-        __memcpy(idx_buf,
-                 idx_ptr,
-                 INDEX_ELEMS * sizeof(int64_t),
-                 GDRAM2NRAM);
-
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int row_base_elem = r * N_COL;
-            int idx_base = r * K_COL;
-
-#pragma unroll
-            for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
-
-                // half block8 最大 byte offset:
-                // (7 * 1024 + 1023) * 2 = 16382
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(half));
-            }
-        }
-
-        // 先完整 gather 到 out_buf，再写回 input 前 32 列。
-        // 这样即使 index 命中前 32 列，也不会被本次写回污染。
-        __gather(out_buf,
-                 input_ptr,
-                 off_buf,
-                 sizeof(half),
-                 GDRAM2NRAM,
-                 sizeof(half),
-                 OUTPUT_ELEMS);
-
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            __memcpy(input + (b0 + r) * N_COL,
-                     out_buf + r * K_COL,
-                     K_COL * sizeof(half),
-                     NRAM2GDRAM);
-        }
-    }
-}
-
-__mlu_entry__ void gather_rows_float_viewout_kernel(
-    float *input,
-    const int64_t *index
-) {
-    uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
-
-    __nram__ int64_t idx_buf[INDEX_ELEMS];
-    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
-    __nram__ float out_buf[OUTPUT_ELEMS];
-
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
-
-    for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
-
-        float *input_ptr = input + b0 * N_COL;
-        const int64_t *idx_ptr = index + b0 * K_COL;
-
-        __memcpy(idx_buf,
-                 idx_ptr,
-                 INDEX_ELEMS * sizeof(int64_t),
-                 GDRAM2NRAM);
-
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int row_base_elem = r * N_COL;
-            int idx_base = r * K_COL;
-
-#pragma unroll
-            for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
-
-                // float block8 最大 byte offset:
-                // (7 * 1024 + 1023) * 4 = 32764
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(float));
-            }
-        }
-
-        __gather(out_buf,
-                 input_ptr,
-                 off_buf,
-                 sizeof(float),
-                 GDRAM2NRAM,
-                 sizeof(float),
-                 OUTPUT_ELEMS);
-
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            __memcpy(input + (b0 + r) * N_COL,
-                     out_buf + r * K_COL,
-                     K_COL * sizeof(float),
-                     NRAM2GDRAM);
-        }
-    }
-}
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
-    // 不 torch::empty，不分配新 output。
-    // 返回 input 每行前 32 列的 view。
-    auto output = input.as_strided({BATCH, K_COL}, {N_COL, 1});
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim = {TASK_DIM, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-
-    if (input.scalar_type() == torch::kHalf) {
-        gather_rows_half_viewout_kernel<<<dim, ktype, queue>>>(
-            (half*)input.data_ptr<at::Half>(),
-            index.data_ptr<int64_t>()
-        );
-    } else {
-        gather_rows_float_viewout_kernel<<<dim, ktype, queue>>>(
-            input.data_ptr<float>(),
-            index.data_ptr<int64_t>()
-        );
-    }
-
-    return output;
+    // 不 launch kernel
+    // 只测 torch::empty + wrapper dispatch + evaluator sync
+    return torch::empty({BATCH, K_COL}, input.options());
 }
