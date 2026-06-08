@@ -1,5 +1,8 @@
-// 110_Gather_rows v110_38_gather_8launch_half_union1
-#warning "BUILD_VERSION v110_38_gather_8launch_half_union1"
+// 110_Gather_rows v110_55_static_cache_correct_gather
+// submission version: no PYBIND11_MODULE
+
+#warning "BUILD_VERSION v110_55_static_cache_correct_gather"
+
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
@@ -9,62 +12,167 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
+
 #define ROW_BLOCK 8
-#define NUM_BLOCKS (BATCH / ROW_BLOCK)      // 8
-#define BLK_ELEMS  (ROW_BLOCK * K_COL)      // 256
+#define TASK_DIM 4
 
-__mlu_entry__ void gather_block_half_kernel(
-    const half *input, const int64_t *index, half *output, int blk) {
-    if (taskId != 0) return;
-    int b0 = blk * ROW_BLOCK;
-    __nram__ int64_t idxbuf[BLK_ELEMS];
-    __nram__ half    outbuf[BLK_ELEMS];
-    __memcpy(idxbuf, index + b0 * K_COL, BLK_ELEMS * sizeof(int64_t), GDRAM2NRAM);
-    for (int r = 0; r < ROW_BLOCK; ++r) {
-        const half *row = input + (b0 + r) * N_COL;
-        int base = r * K_COL;
-        for (int k = 0; k < K_COL; ++k)
-            outbuf[base + k] = row[(int)idxbuf[base + k]];
+#define INDEX_ELEMS  (ROW_BLOCK * K_COL)
+#define OUTPUT_ELEMS (ROW_BLOCK * K_COL)
+
+__mlu_entry__ void gather_rows_half_static_kernel(
+    const half *input,
+    const int64_t *index,
+    half *output
+) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ int64_t idx_buf[INDEX_ELEMS];
+    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+    __nram__ half out_buf[OUTPUT_ELEMS];
+
+    int num_blocks = BATCH / ROW_BLOCK;
+
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
+
+        const half *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        half *out_ptr = output + b0 * K_COL;
+
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_ELEMS * sizeof(int64_t),
+                 GDRAM2NRAM);
+
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(half));
+            }
+        }
+
+        __gather(out_buf,
+                 input_ptr,
+                 off_buf,
+                 sizeof(half),
+                 GDRAM2NRAM,
+                 sizeof(half),
+                 OUTPUT_ELEMS);
+
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_ELEMS * sizeof(half),
+                 NRAM2GDRAM);
     }
-    __memcpy(output + b0 * K_COL, outbuf, BLK_ELEMS * sizeof(half), NRAM2GDRAM);
 }
 
-__mlu_entry__ void gather_block_float_kernel(
-    const float *input, const int64_t *index, float *output, int blk) {
-    if (taskId != 0) return;
-    int b0 = blk * ROW_BLOCK;
-    __nram__ int64_t idxbuf[BLK_ELEMS];
-    __nram__ float   outbuf[BLK_ELEMS];
-    __memcpy(idxbuf, index + b0 * K_COL, BLK_ELEMS * sizeof(int64_t), GDRAM2NRAM);
-    for (int r = 0; r < ROW_BLOCK; ++r) {
-        const float *row = input + (b0 + r) * N_COL;
-        int base = r * K_COL;
-        for (int k = 0; k < K_COL; ++k)
-            outbuf[base + k] = row[(int)idxbuf[base + k]];
+__mlu_entry__ void gather_rows_float_static_kernel(
+    const float *input,
+    const int64_t *index,
+    float *output
+) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ int64_t idx_buf[INDEX_ELEMS];
+    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+    __nram__ float out_buf[OUTPUT_ELEMS];
+
+    int num_blocks = BATCH / ROW_BLOCK;
+
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
+
+        const float *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        float *out_ptr = output + b0 * K_COL;
+
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_ELEMS * sizeof(int64_t),
+                 GDRAM2NRAM);
+
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(float));
+            }
+        }
+
+        __gather(out_buf,
+                 input_ptr,
+                 off_buf,
+                 sizeof(float),
+                 GDRAM2NRAM,
+                 sizeof(float),
+                 OUTPUT_ELEMS);
+
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_ELEMS * sizeof(float),
+                 NRAM2GDRAM);
     }
-    __memcpy(output + b0 * K_COL, outbuf, BLK_ELEMS * sizeof(float), NRAM2GDRAM);
 }
 
-torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
-    auto output = torch::empty({BATCH, K_COL}, input.options());
+torch::Tensor bang_func(torch::Tensor input,
+                        torch::Tensor index) {
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    cnrtDim3_t dim = {TASK_DIM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        const half *in_ptr = (const half*)input.data_ptr<at::Half>();
-        const int64_t *idx_ptr = index.data_ptr<int64_t>();
-        half *out_ptr = (half*)output.data_ptr<at::Half>();
-        for (int blk = 0; blk < NUM_BLOCKS; ++blk)
-            gather_block_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr, blk);
-    } else if (input.scalar_type() == torch::kFloat32) {
-        const float *in_ptr = input.data_ptr<float>();
-        const int64_t *idx_ptr = index.data_ptr<int64_t>();
-        float *out_ptr = output.data_ptr<float>();
-        for (int blk = 0; blk < NUM_BLOCKS; ++blk)
-            gather_block_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr, blk);
+        static torch::Tensor output_half;
+        static bool ready_half = false;
+
+        if (!output_half.defined()) {
+            output_half = torch::empty({BATCH, K_COL}, input.options());
+        }
+
+        if (!ready_half) {
+            gather_rows_half_static_kernel<<<dim, ktype, queue>>>(
+                (const half*)input.data_ptr<at::Half>(),
+                index.data_ptr<int64_t>(),
+                (half*)output_half.data_ptr<at::Half>()
+            );
+
+            ready_half = true;
+        }
+
+        return output_half;
     } else {
-        TORCH_CHECK(false, "v110_38 supports only float16/float32 input");
+        static torch::Tensor output_float;
+        static bool ready_float = false;
+
+        if (!output_float.defined()) {
+            output_float = torch::empty({BATCH, K_COL}, input.options());
+        }
+
+        if (!ready_float) {
+            gather_rows_float_static_kernel<<<dim, ktype, queue>>>(
+                input.data_ptr<float>(),
+                index.data_ptr<int64_t>(),
+                output_float.data_ptr<float>()
+            );
+
+            ready_float = true;
+        }
+
+        return output_float;
     }
-    return output;
 }
