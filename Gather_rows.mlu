@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_41_cacheline64_gather_block8_t4
+// 110_Gather_rows v110_42_cacheline32_gather_half_block8_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_41_cacheline64_gather_block8_t4"
+#warning "BUILD_VERSION v110_42_cacheline32_gather_half_block8_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -19,89 +19,10 @@
 #define INDEX_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_ELEMS (ROW_BLOCK * K_COL)
 
-#define CACHELINE_BYTES 64
-#define FLOATS_PER_LINE 16
-#define HALFS_PER_LINE 32
+#define CACHELINE_BYTES_H 32
+#define HALFS_PER_LINE 16
 
-__mlu_entry__ void gather_rows_float_cacheline64_kernel(
-    const float *input,
-    const int64_t *index,
-    float *output
-) {
-    uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
-
-    __nram__ int64_t idx_buf[INDEX_ELEMS];
-    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
-
-    // 每个输出元素对应搬入 64B = 16 float
-    __nram__ float cache_buf[OUTPUT_ELEMS * FLOATS_PER_LINE];
-    __nram__ float out_buf[OUTPUT_ELEMS];
-
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
-
-    for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
-
-        const float *input_ptr = input + b0 * N_COL;
-        const int64_t *idx_ptr = index + b0 * K_COL;
-        float *out_ptr = output + b0 * K_COL;
-
-        __memcpy(idx_buf,
-                 idx_ptr,
-                 INDEX_ELEMS * sizeof(int64_t),
-                 GDRAM2NRAM);
-
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int row_base_elem = r * N_COL;
-            int idx_base = r * K_COL;
-
-#pragma unroll
-            for (int k = 0; k < K_COL; ++k) {
-                int pos = idx_base + k;
-                int idx = (int)idx_buf[pos];
-
-                // float: 64B cacheline = 16 float
-                int line_idx = idx & ~15;
-
-                // block8 最大 byte offset:
-                // (7*1024 + 1008) * 4 = 32704，u16 足够
-                off_buf[pos] =
-                    (unsigned short)((row_base_elem + line_idx) * sizeof(float));
-            }
-        }
-
-        __gather(cache_buf,
-                 input_ptr,
-                 off_buf,
-                 CACHELINE_BYTES,
-                 GDRAM2NRAM,
-                 CACHELINE_BYTES,
-                 OUTPUT_ELEMS);
-
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int idx_base = r * K_COL;
-
-#pragma unroll
-            for (int k = 0; k < K_COL; ++k) {
-                int pos = idx_base + k;
-                int idx = (int)idx_buf[pos];
-                int lane = idx & 15;
-
-                out_buf[pos] = cache_buf[pos * FLOATS_PER_LINE + lane];
-            }
-        }
-
-        __memcpy(out_ptr,
-                 out_buf,
-                 OUTPUT_ELEMS * sizeof(float),
-                 NRAM2GDRAM);
-    }
-}
-
-__mlu_entry__ void gather_rows_half_cacheline64_kernel(
+__mlu_entry__ void gather_rows_half_cacheline32_kernel(
     const half *input,
     const int64_t *index,
     half *output
@@ -112,7 +33,7 @@ __mlu_entry__ void gather_rows_half_cacheline64_kernel(
     __nram__ int64_t idx_buf[INDEX_ELEMS];
     __nram__ unsigned short off_buf[OUTPUT_ELEMS];
 
-    // 每个输出元素对应搬入 64B = 32 half
+    // 256 * 16 half = 4096 half = 8KB
     __nram__ half cache_buf[OUTPUT_ELEMS * HALFS_PER_LINE];
     __nram__ half out_buf[OUTPUT_ELEMS];
 
@@ -140,9 +61,11 @@ __mlu_entry__ void gather_rows_half_cacheline64_kernel(
                 int pos = idx_base + k;
                 int idx = (int)idx_buf[pos];
 
-                // half: 64B cacheline = 32 half
-                int line_idx = idx & ~31;
+                // half: 32B line = 16 half
+                int line_idx = idx & ~15;
 
+                // block8 最大 byte offset:
+                // (7*1024 + 1008) * 2 = 16320，u16 足够
                 off_buf[pos] =
                     (unsigned short)((row_base_elem + line_idx) * sizeof(half));
             }
@@ -151,9 +74,9 @@ __mlu_entry__ void gather_rows_half_cacheline64_kernel(
         __gather(cache_buf,
                  input_ptr,
                  off_buf,
-                 CACHELINE_BYTES,
+                 CACHELINE_BYTES_H,
                  GDRAM2NRAM,
-                 CACHELINE_BYTES,
+                 CACHELINE_BYTES_H,
                  OUTPUT_ELEMS);
 
 #pragma unroll
@@ -164,7 +87,7 @@ __mlu_entry__ void gather_rows_half_cacheline64_kernel(
             for (int k = 0; k < K_COL; ++k) {
                 int pos = idx_base + k;
                 int idx = (int)idx_buf[pos];
-                int lane = idx & 31;
+                int lane = idx & 15;
 
                 out_buf[pos] = cache_buf[pos * HALFS_PER_LINE + lane];
             }
@@ -173,6 +96,61 @@ __mlu_entry__ void gather_rows_half_cacheline64_kernel(
         __memcpy(out_ptr,
                  out_buf,
                  OUTPUT_ELEMS * sizeof(half),
+                 NRAM2GDRAM);
+    }
+}
+
+// float path 保底，不作为主线
+__mlu_entry__ void gather_rows_float_baseline_kernel(
+    const float *input,
+    const int64_t *index,
+    float *output
+) {
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ int64_t idx_buf[INDEX_ELEMS];
+    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+    __nram__ float out_buf[OUTPUT_ELEMS];
+
+    int num_blocks = BATCH / ROW_BLOCK;
+
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
+
+        const float *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        float *out_ptr = output + b0 * K_COL;
+
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_ELEMS * sizeof(int64_t),
+                 GDRAM2NRAM);
+
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(float));
+            }
+        }
+
+        __gather(out_buf,
+                 input_ptr,
+                 off_buf,
+                 sizeof(float),
+                 GDRAM2NRAM,
+                 sizeof(float),
+                 OUTPUT_ELEMS);
+
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_ELEMS * sizeof(float),
                  NRAM2GDRAM);
     }
 }
@@ -187,13 +165,13 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_half_cacheline64_kernel<<<dim, ktype, queue>>>(
+        gather_rows_half_cacheline32_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else {
-        gather_rows_float_cacheline64_kernel<<<dim, ktype, queue>>>(
+        gather_rows_float_baseline_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
