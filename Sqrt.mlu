@@ -1,0 +1,44 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define BLOCK_SIZE 256
+
+__mlu_entry__ void sqrt_kernel(half *input, half *output, int total) {
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+    uint32_t start = task_id * BLOCK_SIZE;
+    uint32_t stride = task_num * BLOCK_SIZE;
+
+    __nram__ half buffer[BLOCK_SIZE];
+
+    for (uint32_t offset = start; offset < (uint32_t)total; offset += stride) {
+        uint32_t remain = (uint32_t)total - offset;
+        uint32_t len = remain > BLOCK_SIZE ? BLOCK_SIZE : remain;
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(buffer, input + offset, len * sizeof(half), GDRAM2NRAM);
+        __bang_abs(buffer, buffer, aligned_len);
+        __bang_sqrt(buffer, buffer, aligned_len);
+        __memcpy(output + offset, buffer, len * sizeof(half), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input) {
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat16, "input must be float16");
+
+    auto output = torch::empty_like(input);
+    int total = input.numel();
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    sqrt_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<half *>(input.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+        total);
+
+    return output;
+}
