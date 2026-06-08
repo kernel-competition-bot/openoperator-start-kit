@@ -1,6 +1,7 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <stdint.h>
 #include "framework/core/MLUStream.h"
 
 #define BATCH 64
@@ -15,6 +16,8 @@ __mlu_entry__ void gather_rows_float_kernel(
 ) {
     uint32_t tid = taskId;
 
+    __nram__ float rowbuf[N];
+    __nram__ int64_t idxbuf[K];
     __nram__ float outbuf[K];
 
     for (int b = tid; b < BATCH; b += TASK_DIM) {
@@ -22,9 +25,20 @@ __mlu_entry__ void gather_rows_float_kernel(
         int idx_base = b * K;
         int out_base = b * K;
 
+        // 连续搬整行，避免 32 次随机 GDRAM scalar load
+        __memcpy(rowbuf,
+                 input + in_base,
+                 N * sizeof(float),
+                 GDRAM2NRAM);
+
+        __memcpy(idxbuf,
+                 index + idx_base,
+                 K * sizeof(int64_t),
+                 GDRAM2NRAM);
+
         for (int k = 0; k < K; ++k) {
-            int idx = (int)index[idx_base + k];
-            outbuf[k] = input[in_base + idx];
+            int idx = (int)idxbuf[k];
+            outbuf[k] = rowbuf[idx];
         }
 
         __memcpy(output + out_base,
@@ -41,6 +55,8 @@ __mlu_entry__ void gather_rows_half_kernel(
 ) {
     uint32_t tid = taskId;
 
+    __nram__ half rowbuf[N];
+    __nram__ int64_t idxbuf[K];
     __nram__ half outbuf[K];
 
     for (int b = tid; b < BATCH; b += TASK_DIM) {
@@ -48,9 +64,20 @@ __mlu_entry__ void gather_rows_half_kernel(
         int idx_base = b * K;
         int out_base = b * K;
 
+        // Half 一整行只有 2048B，连续搬入 NRAM 很便宜
+        __memcpy(rowbuf,
+                 input + in_base,
+                 N * sizeof(half),
+                 GDRAM2NRAM);
+
+        __memcpy(idxbuf,
+                 index + idx_base,
+                 K * sizeof(int64_t),
+                 GDRAM2NRAM);
+
         for (int k = 0; k < K; ++k) {
-            int idx = (int)index[idx_base + k];
-            outbuf[k] = input[in_base + idx];
+            int idx = (int)idxbuf[k];
+            outbuf[k] = rowbuf[idx];
         }
 
         __memcpy(output + out_base,
@@ -64,10 +91,14 @@ torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
     TORCH_CHECK(index.is_contiguous(), "index must be contiguous");
+
     TORCH_CHECK(input.dim() == 2, "input must be 2D");
     TORCH_CHECK(index.dim() == 2, "index must be 2D");
-    TORCH_CHECK(input.size(0) == BATCH && input.size(1) == N, "110 assumes input [64,1024]");
-    TORCH_CHECK(index.size(0) == BATCH && index.size(1) == K, "110 assumes index [64,32]");
+
+    TORCH_CHECK(input.size(0) == BATCH && input.size(1) == N,
+                "110 assumes input [64,1024]");
+    TORCH_CHECK(index.size(0) == BATCH && index.size(1) == K,
+                "110 assumes index [64,32]");
 
     auto output = torch::empty(
         {BATCH, K},
