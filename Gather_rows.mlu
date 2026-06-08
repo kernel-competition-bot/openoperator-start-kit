@@ -1,17 +1,55 @@
-// 110_Gather_rows v110_50_probe_Pa_empty_only
+// 110_Gather_rows v110_51_probe_Pb_empty_kernel
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_50_probe_Pa_empty_only"
+#warning "BUILD_VERSION v110_51_probe_Pb_empty_kernel"
 
+#include <bang.h>
 #include <torch/extension.h>
+#include <cnrt.h>
 #include <stdint.h>
+#include "framework/core/MLUStream.h"
 
 #define BATCH 64
 #define K_COL 32
 
+__mlu_entry__ void empty_half_kernel(
+    const half *input,
+    const int64_t *index,
+    half *output
+) {
+    if (taskId != 0) return;
+}
+
+__mlu_entry__ void empty_float_kernel(
+    const float *input,
+    const int64_t *index,
+    float *output
+) {
+    if (taskId != 0) return;
+}
+
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
-    // 不 launch kernel
-    // 只测 torch::empty + wrapper dispatch + evaluator sync
-    return torch::empty({BATCH, K_COL}, input.options());
+    auto output = torch::empty({BATCH, K_COL}, input.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    if (input.scalar_type() == torch::kHalf) {
+        empty_half_kernel<<<dim, ktype, queue>>>(
+            (const half*)input.data_ptr<at::Half>(),
+            index.data_ptr<int64_t>(),
+            (half*)output.data_ptr<at::Half>()
+        );
+    } else {
+        empty_float_kernel<<<dim, ktype, queue>>>(
+            input.data_ptr<float>(),
+            index.data_ptr<int64_t>(),
+            output.data_ptr<float>()
+        );
+    }
+
+    return output;
 }
