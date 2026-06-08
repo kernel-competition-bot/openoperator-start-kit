@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_36a_probe_emptyKernel_union1
+// 110_Gather_rows v110_37a_probe_launchcost_x8
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_36a_probe_emptyKernel_union1"
+#warning "BUILD_VERSION v110_37a_probe_launchcost_x8"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,21 +12,19 @@
 #define BATCH 64
 #define K_COL 32
 
-__mlu_entry__ void empty_half_kernel_union1(
+__mlu_entry__ void empty_half_kernel_x8(
     const half *input,
     const int64_t *index,
     half *output
 ) {
-    // 空 kernel，只测 launch/sync，不做任何读写
     if (taskId != 0) return;
 }
 
-__mlu_entry__ void empty_float_kernel_union1(
+__mlu_entry__ void empty_float_kernel_x8(
     const float *input,
     const int64_t *index,
     float *output
 ) {
-    // 保底 float path，线上大概率不会走
     if (taskId != 0) return;
 }
 
@@ -36,23 +34,36 @@ torch::Tensor bang_func(torch::Tensor input,
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // Union1: 一个 task 占一个 cluster。
-    // MLU3xx 常见每 cluster 4 个 MLU Core，因此 dim.x=4。
+    // Union1: 1 个 cluster，MLU3xx 常见 4 核/簇
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     if (input.scalar_type() == torch::kHalf) {
-        empty_half_kernel_union1<<<dim, ktype, queue>>>(
-            (const half*)input.data_ptr<at::Half>(),
-            index.data_ptr<int64_t>(),
-            (half*)output.data_ptr<at::Half>()
-        );
+        const half *in_ptr = (const half*)input.data_ptr<at::Half>();
+        const int64_t *idx_ptr = index.data_ptr<int64_t>();
+        half *out_ptr = (half*)output.data_ptr<at::Half>();
+
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
     } else {
-        empty_float_kernel_union1<<<dim, ktype, queue>>>(
-            input.data_ptr<float>(),
-            index.data_ptr<int64_t>(),
-            output.data_ptr<float>()
-        );
+        const float *in_ptr = input.data_ptr<float>();
+        const int64_t *idx_ptr = index.data_ptr<int64_t>();
+        float *out_ptr = output.data_ptr<float>();
+
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
     }
 
     return output;
