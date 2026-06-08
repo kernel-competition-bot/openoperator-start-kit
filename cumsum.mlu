@@ -4,25 +4,23 @@
 
 #define ROWS 128
 #define COLS 4000
-#define NRAM_SIZE 4096
-#define TASK_NUM 4
+#define CHUNK_SIZE 4096
+#define TASK_NUM 128
 
-__mlu_entry__ void cumsum_dim1_kernel(
+__mlu_entry__ void cumsum_dim1_float_kernel(
     float* input,
     float* output,
     int rows,
     int cols
 ) {
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+    uint32_t tid = taskId;
+    uint32_t task_num = taskDim;
 
-    __nram__ float buf[NRAM_SIZE];
-    __nram__ float tmp[NRAM_SIZE];
+    __nram__ float buf[CHUNK_SIZE];
 
-    for (int row = core_id; row < rows; row += core_num) {
+    for (int row = tid; row < rows; row += task_num) {
         int base = row * cols;
 
-        // Load one full row into NRAM.
         __memcpy(
             buf,
             input + base,
@@ -30,25 +28,12 @@ __mlu_entry__ void cumsum_dim1_kernel(
             GDRAM2NRAM
         );
 
-        for (int offset = 1; offset < cols; offset <<= 1) {
-            int valid_len = cols - offset;
+        float acc = 0.0f;
 
-            __memcpy(
-                tmp + offset,
-                buf,
-                valid_len * sizeof(float),
-                NRAM2NRAM
-            );
-
-        
-            int aligned_len = (valid_len + 63) & ~63;
-
-            __bang_add(
-                buf + offset,
-                buf + offset,
-                tmp + offset,
-                aligned_len
-            );
+        // 顺序累加，尽量贴近 torch.cumsum 的 running sum 语义
+        for (int col = 0; col < cols; ++col) {
+            acc = acc + buf[col];
+            buf[col] = acc;
         }
 
         __memcpy(
@@ -60,40 +45,77 @@ __mlu_entry__ void cumsum_dim1_kernel(
     }
 }
 
+__mlu_entry__ void cumsum_dim1_half_kernel(
+    half* input,
+    half* output,
+    int rows,
+    int cols
+) {
+    uint32_t tid = taskId;
+    uint32_t task_num = taskDim;
+
+    __nram__ half buf[CHUNK_SIZE];
+
+    for (int row = tid; row < rows; row += task_num) {
+        int base = row * cols;
+
+        __memcpy(
+            buf,
+            input + base,
+            cols * sizeof(half),
+            GDRAM2NRAM
+        );
+
+        half acc = (half)0.0f;
+
+        for (int col = 0; col < cols; ++col) {
+            acc = acc + buf[col];
+            buf[col] = acc;
+        }
+
+        __memcpy(
+            output + base,
+            buf,
+            cols * sizeof(half),
+            NRAM2GDRAM
+        );
+    }
+}
+
 torch::Tensor bang_func(
     torch::Tensor input,
     int dim
 ) {
-    TORCH_CHECK(input.dim() == 2, "cumsum.mlu only supports 2D input.");
+    TORCH_CHECK(input.dim() == 2, "cumsum.mlu only supports 2D input for this problem.");
     TORCH_CHECK(dim == 1 || dim == -1, "cumsum.mlu only supports dim = 1.");
     TORCH_CHECK(input.size(0) == ROWS, "Expected input.size(0) == 128.");
     TORCH_CHECK(input.size(1) == COLS, "Expected input.size(1) == 4000.");
 
-    auto original_dtype = input.scalar_type();
-
-    // Kernel computes in float32.
-    torch::Tensor input_fp32 = input.contiguous();
-    if (original_dtype != torch::kFloat) {
-        input_fp32 = input_fp32.to(torch::kFloat);
-    }
-
-    torch::Tensor output_fp32 = torch::empty_like(input_fp32);
+    torch::Tensor x = input.contiguous();
+    torch::Tensor output = torch::empty_like(x);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t k_dim = {TASK_NUM, 1, 1};
     cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
 
-    cumsum_dim1_kernel<<<k_dim, k_type, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        ROWS,
-        COLS
-    );
-
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
+    if (x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kFloat) {
+        cumsum_dim1_float_kernel<<<k_dim, k_type, queue>>>(
+            x.data_ptr<float>(),
+            output.data_ptr<float>(),
+            ROWS,
+            COLS
+        );
+    } else if (x.scalar_type() == torch::kFloat16 || x.scalar_type() == torch::kHalf) {
+        cumsum_dim1_half_kernel<<<k_dim, k_type, queue>>>(
+            reinterpret_cast<half*>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+            ROWS,
+            COLS
+        );
+    } else {
+        TORCH_CHECK(false, "cumsum.mlu only supports float32 and float16 input.");
     }
 
-    return output_fp32;
+    return output;
 }
