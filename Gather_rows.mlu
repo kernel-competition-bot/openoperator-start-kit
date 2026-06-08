@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_40_gather_async_block8_t4
+// 110_Gather_rows v110_41_cacheline64_gather_block8_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_40_gather_async_block8_t4"
+#warning "BUILD_VERSION v110_41_cacheline64_gather_block8_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -19,7 +19,11 @@
 #define INDEX_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_ELEMS (ROW_BLOCK * K_COL)
 
-__mlu_entry__ void gather_rows_float_gather_async_block8_kernel(
+#define CACHELINE_BYTES 64
+#define FLOATS_PER_LINE 16
+#define HALFS_PER_LINE 32
+
+__mlu_entry__ void gather_rows_float_cacheline64_kernel(
     const float *input,
     const int64_t *index,
     float *output
@@ -29,6 +33,9 @@ __mlu_entry__ void gather_rows_float_gather_async_block8_kernel(
 
     __nram__ int64_t idx_buf[INDEX_ELEMS];
     __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+
+    // 每个输出元素对应搬入 64B = 16 float
+    __nram__ float cache_buf[OUTPUT_ELEMS * FLOATS_PER_LINE];
     __nram__ float out_buf[OUTPUT_ELEMS];
 
     int num_blocks = BATCH / ROW_BLOCK;  // 8
@@ -52,25 +59,40 @@ __mlu_entry__ void gather_rows_float_gather_async_block8_kernel(
 
 #pragma unroll
             for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
+                int pos = idx_base + k;
+                int idx = (int)idx_buf[pos];
 
-                // float block8 最大 byte offset:
-                // (7 * 1024 + 1023) * 4 = 32764
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(float));
+                // float: 64B cacheline = 16 float
+                int line_idx = idx & ~15;
+
+                // block8 最大 byte offset:
+                // (7*1024 + 1008) * 4 = 32704，u16 足够
+                off_buf[pos] =
+                    (unsigned short)((row_base_elem + line_idx) * sizeof(float));
             }
         }
 
-        __gather_async(out_buf,
-                       input_ptr,
-                       off_buf,
-                       sizeof(float),
-                       GDRAM2NRAM,
-                       sizeof(float),
-                       OUTPUT_ELEMS);
+        __gather(cache_buf,
+                 input_ptr,
+                 off_buf,
+                 CACHELINE_BYTES,
+                 GDRAM2NRAM,
+                 CACHELINE_BYTES,
+                 OUTPUT_ELEMS);
 
-        // async gather 写 out_buf；output copy 前必须同步 IO/MOVE/COMPUTE
-        __sync_io_move_compute();
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int pos = idx_base + k;
+                int idx = (int)idx_buf[pos];
+                int lane = idx & 15;
+
+                out_buf[pos] = cache_buf[pos * FLOATS_PER_LINE + lane];
+            }
+        }
 
         __memcpy(out_ptr,
                  out_buf,
@@ -79,7 +101,7 @@ __mlu_entry__ void gather_rows_float_gather_async_block8_kernel(
     }
 }
 
-__mlu_entry__ void gather_rows_half_gather_async_block8_kernel(
+__mlu_entry__ void gather_rows_half_cacheline64_kernel(
     const half *input,
     const int64_t *index,
     half *output
@@ -89,6 +111,9 @@ __mlu_entry__ void gather_rows_half_gather_async_block8_kernel(
 
     __nram__ int64_t idx_buf[INDEX_ELEMS];
     __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+
+    // 每个输出元素对应搬入 64B = 32 half
+    __nram__ half cache_buf[OUTPUT_ELEMS * HALFS_PER_LINE];
     __nram__ half out_buf[OUTPUT_ELEMS];
 
     int num_blocks = BATCH / ROW_BLOCK;  // 8
@@ -112,22 +137,38 @@ __mlu_entry__ void gather_rows_half_gather_async_block8_kernel(
 
 #pragma unroll
             for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
+                int pos = idx_base + k;
+                int idx = (int)idx_buf[pos];
 
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(half));
+                // half: 64B cacheline = 32 half
+                int line_idx = idx & ~31;
+
+                off_buf[pos] =
+                    (unsigned short)((row_base_elem + line_idx) * sizeof(half));
             }
         }
 
-        __gather_async(out_buf,
-                       input_ptr,
-                       off_buf,
-                       sizeof(half),
-                       GDRAM2NRAM,
-                       sizeof(half),
-                       OUTPUT_ELEMS);
+        __gather(cache_buf,
+                 input_ptr,
+                 off_buf,
+                 CACHELINE_BYTES,
+                 GDRAM2NRAM,
+                 CACHELINE_BYTES,
+                 OUTPUT_ELEMS);
 
-        __sync_io_move_compute();
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int pos = idx_base + k;
+                int idx = (int)idx_buf[pos];
+                int lane = idx & 31;
+
+                out_buf[pos] = cache_buf[pos * HALFS_PER_LINE + lane];
+            }
+        }
 
         __memcpy(out_ptr,
                  out_buf,
@@ -146,13 +187,13 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_half_gather_async_block8_kernel<<<dim, ktype, queue>>>(
+        gather_rows_half_cacheline64_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else {
-        gather_rows_float_gather_async_block8_kernel<<<dim, ktype, queue>>>(
+        gather_rows_float_cacheline64_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
