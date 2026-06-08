@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_38_loadgdram_row2_t32
+// 110_Gather_rows v110_39_loadgdram_t64_union1
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_38_loadgdram_row2_t32"
+#warning "BUILD_VERSION v110_39_loadgdram_t64_union1"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,106 +12,93 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define ROWS_PER_TASK 2
-#define TASK_DIM 32
+#define TASK_DIM 64
 
-#define DO_FLOAT_ROW(SLOT, ROW) do {                                      \
-    int in_base = (ROW) * N_COL;                                           \
-    int idx_base = (ROW) * K_COL;                                          \
-    DO_FLOAT_ONE((SLOT), 0);  DO_FLOAT_ONE((SLOT), 1);                     \
-    DO_FLOAT_ONE((SLOT), 2);  DO_FLOAT_ONE((SLOT), 3);                     \
-    DO_FLOAT_ONE((SLOT), 4);  DO_FLOAT_ONE((SLOT), 5);                     \
-    DO_FLOAT_ONE((SLOT), 6);  DO_FLOAT_ONE((SLOT), 7);                     \
-    DO_FLOAT_ONE((SLOT), 8);  DO_FLOAT_ONE((SLOT), 9);                     \
-    DO_FLOAT_ONE((SLOT), 10); DO_FLOAT_ONE((SLOT), 11);                    \
-    DO_FLOAT_ONE((SLOT), 12); DO_FLOAT_ONE((SLOT), 13);                    \
-    DO_FLOAT_ONE((SLOT), 14); DO_FLOAT_ONE((SLOT), 15);                    \
-    DO_FLOAT_ONE((SLOT), 16); DO_FLOAT_ONE((SLOT), 17);                    \
-    DO_FLOAT_ONE((SLOT), 18); DO_FLOAT_ONE((SLOT), 19);                    \
-    DO_FLOAT_ONE((SLOT), 20); DO_FLOAT_ONE((SLOT), 21);                    \
-    DO_FLOAT_ONE((SLOT), 22); DO_FLOAT_ONE((SLOT), 23);                    \
-    DO_FLOAT_ONE((SLOT), 24); DO_FLOAT_ONE((SLOT), 25);                    \
-    DO_FLOAT_ONE((SLOT), 26); DO_FLOAT_ONE((SLOT), 27);                    \
-    DO_FLOAT_ONE((SLOT), 28); DO_FLOAT_ONE((SLOT), 29);                    \
-    DO_FLOAT_ONE((SLOT), 30); DO_FLOAT_ONE((SLOT), 31);                    \
+#define DO_FLOAT(K) do {                                      \
+    int idx = __load_gdram(index32 + ((idx_base + (K)) * 2));  \
+    out_buf[(K)] = __load_gdram(input + in_base + idx);        \
 } while (0)
 
-#define DO_FLOAT_ONE(SLOT, K) do {                                         \
-    int idx = __load_gdram(index32 + ((idx_base + (K)) * 2));              \
-    out_buf[(SLOT) * K_COL + (K)] = __load_gdram(input + in_base + idx);   \
+#define DO_HALF(K) do {                                       \
+    int idx = __load_gdram(index32 + ((idx_base + (K)) * 2));  \
+    out_buf[(K)] = __load_gdram(input + in_base + idx);        \
 } while (0)
 
-#define DO_HALF_ROW(SLOT, ROW) do {                                        \
-    int in_base = (ROW) * N_COL;                                           \
-    int idx_base = (ROW) * K_COL;                                          \
-    DO_HALF_ONE((SLOT), 0);  DO_HALF_ONE((SLOT), 1);                       \
-    DO_HALF_ONE((SLOT), 2);  DO_HALF_ONE((SLOT), 3);                       \
-    DO_HALF_ONE((SLOT), 4);  DO_HALF_ONE((SLOT), 5);                       \
-    DO_HALF_ONE((SLOT), 6);  DO_HALF_ONE((SLOT), 7);                       \
-    DO_HALF_ONE((SLOT), 8);  DO_HALF_ONE((SLOT), 9);                       \
-    DO_HALF_ONE((SLOT), 10); DO_HALF_ONE((SLOT), 11);                      \
-    DO_HALF_ONE((SLOT), 12); DO_HALF_ONE((SLOT), 13);                      \
-    DO_HALF_ONE((SLOT), 14); DO_HALF_ONE((SLOT), 15);                      \
-    DO_HALF_ONE((SLOT), 16); DO_HALF_ONE((SLOT), 17);                      \
-    DO_HALF_ONE((SLOT), 18); DO_HALF_ONE((SLOT), 19);                      \
-    DO_HALF_ONE((SLOT), 20); DO_HALF_ONE((SLOT), 21);                      \
-    DO_HALF_ONE((SLOT), 22); DO_HALF_ONE((SLOT), 23);                      \
-    DO_HALF_ONE((SLOT), 24); DO_HALF_ONE((SLOT), 25);                      \
-    DO_HALF_ONE((SLOT), 26); DO_HALF_ONE((SLOT), 27);                      \
-    DO_HALF_ONE((SLOT), 28); DO_HALF_ONE((SLOT), 29);                      \
-    DO_HALF_ONE((SLOT), 30); DO_HALF_ONE((SLOT), 31);                      \
+#define DO_ALL_FLOAT() do { \
+    DO_FLOAT(0);  DO_FLOAT(1);  DO_FLOAT(2);  DO_FLOAT(3);  \
+    DO_FLOAT(4);  DO_FLOAT(5);  DO_FLOAT(6);  DO_FLOAT(7);  \
+    DO_FLOAT(8);  DO_FLOAT(9);  DO_FLOAT(10); DO_FLOAT(11); \
+    DO_FLOAT(12); DO_FLOAT(13); DO_FLOAT(14); DO_FLOAT(15); \
+    DO_FLOAT(16); DO_FLOAT(17); DO_FLOAT(18); DO_FLOAT(19); \
+    DO_FLOAT(20); DO_FLOAT(21); DO_FLOAT(22); DO_FLOAT(23); \
+    DO_FLOAT(24); DO_FLOAT(25); DO_FLOAT(26); DO_FLOAT(27); \
+    DO_FLOAT(28); DO_FLOAT(29); DO_FLOAT(30); DO_FLOAT(31); \
 } while (0)
 
-#define DO_HALF_ONE(SLOT, K) do {                                          \
-    int idx = __load_gdram(index32 + ((idx_base + (K)) * 2));              \
-    out_buf[(SLOT) * K_COL + (K)] = __load_gdram(input + in_base + idx);   \
+#define DO_ALL_HALF() do { \
+    DO_HALF(0);  DO_HALF(1);  DO_HALF(2);  DO_HALF(3);  \
+    DO_HALF(4);  DO_HALF(5);  DO_HALF(6);  DO_HALF(7);  \
+    DO_HALF(8);  DO_HALF(9);  DO_HALF(10); DO_HALF(11); \
+    DO_HALF(12); DO_HALF(13); DO_HALF(14); DO_HALF(15); \
+    DO_HALF(16); DO_HALF(17); DO_HALF(18); DO_HALF(19); \
+    DO_HALF(20); DO_HALF(21); DO_HALF(22); DO_HALF(23); \
+    DO_HALF(24); DO_HALF(25); DO_HALF(26); DO_HALF(27); \
+    DO_HALF(28); DO_HALF(29); DO_HALF(30); DO_HALF(31); \
 } while (0)
 
-__mlu_entry__ void gather_rows_float_loadgdram_row2_kernel(
+__mlu_entry__ void gather_rows_float_loadgdram_union1_kernel(
     const float *input,
     const int64_t *index,
     float *output
 ) {
-    uint32_t tid = taskId;
-    if (tid >= TASK_DIM) return;
+#ifdef __BANG_ARCH__
+    if (__is_mpu()) return;
+#endif
+
+    uint32_t b = taskId;
+    if (b >= BATCH) return;
 
     const int32_t *index32 = (const int32_t *)index;
 
-    __nram__ float out_buf[ROWS_PER_TASK * K_COL];
+    __nram__ float out_buf[K_COL];
 
-    int row0 = tid * ROWS_PER_TASK;
-    int row1 = row0 + 1;
+    int in_base = b * N_COL;
+    int idx_base = b * K_COL;
+    int out_base = b * K_COL;
 
-    DO_FLOAT_ROW(0, row0);
-    DO_FLOAT_ROW(1, row1);
+    DO_ALL_FLOAT();
 
-    __memcpy(output + row0 * K_COL,
+    __memcpy(output + out_base,
              out_buf,
-             ROWS_PER_TASK * K_COL * sizeof(float),
+             K_COL * sizeof(float),
              NRAM2GDRAM);
 }
 
-__mlu_entry__ void gather_rows_half_loadgdram_row2_kernel(
+__mlu_entry__ void gather_rows_half_loadgdram_union1_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
-    uint32_t tid = taskId;
-    if (tid >= TASK_DIM) return;
+#ifdef __BANG_ARCH__
+    if (__is_mpu()) return;
+#endif
+
+    uint32_t b = taskId;
+    if (b >= BATCH) return;
 
     const int32_t *index32 = (const int32_t *)index;
 
-    __nram__ half out_buf[ROWS_PER_TASK * K_COL];
+    __nram__ half out_buf[K_COL];
 
-    int row0 = tid * ROWS_PER_TASK;
-    int row1 = row0 + 1;
+    int in_base = b * N_COL;
+    int idx_base = b * K_COL;
+    int out_base = b * K_COL;
 
-    DO_HALF_ROW(0, row0);
-    DO_HALF_ROW(1, row1);
+    DO_ALL_HALF();
 
-    __memcpy(output + row0 * K_COL,
+    __memcpy(output + out_base,
              out_buf,
-             ROWS_PER_TASK * K_COL * sizeof(half),
+             K_COL * sizeof(half),
              NRAM2GDRAM);
 }
 
@@ -120,17 +107,20 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
     cnrtDim3_t dim = {TASK_DIM, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    // Union1 要求 dim.x 是 4 的倍数；64 满足
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_half_loadgdram_row2_kernel<<<dim, ktype, queue>>>(
+        gather_rows_half_loadgdram_union1_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else {
-        gather_rows_float_loadgdram_row2_kernel<<<dim, ktype, queue>>>(
+        gather_rows_float_loadgdram_union1_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
