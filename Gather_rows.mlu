@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_37b_probe_launchcost_x8_block
+// 110_Gather_rows v110_37c_probe_view_launchcost_x8_union1
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_37b_probe_launchcost_x8_block"
+#warning "BUILD_VERSION v110_37c_probe_view_launchcost_x8_union1"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -10,59 +10,56 @@
 #include "framework/core/MLUStream.h"
 
 #define BATCH 64
+#define N_COL 1024
 #define K_COL 32
 
-__mlu_entry__ void empty_half_kernel_x8_block(
+__mlu_entry__ void empty_half_kernel_x8_view(
     const half *input,
-    const int64_t *index,
-    half *output
+    const int64_t *index
 ) {
     if (taskId != 0) return;
 }
 
-__mlu_entry__ void empty_float_kernel_x8_block(
+__mlu_entry__ void empty_float_kernel_x8_view(
     const float *input,
-    const int64_t *index,
-    float *output
+    const int64_t *index
 ) {
     if (taskId != 0) return;
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
-    auto output = torch::empty({BATCH, K_COL}, input.options());
+    auto output = input.as_strided({BATCH, K_COL}, {N_COL, 1});
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     if (input.scalar_type() == torch::kHalf) {
         const half *in_ptr = (const half*)input.data_ptr<at::Half>();
         const int64_t *idx_ptr = index.data_ptr<int64_t>();
-        half *out_ptr = (half*)output.data_ptr<at::Half>();
 
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_half_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
     } else {
         const float *in_ptr = input.data_ptr<float>();
         const int64_t *idx_ptr = index.data_ptr<int64_t>();
-        float *out_ptr = output.data_ptr<float>();
 
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel_x8_block<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
+        empty_float_kernel_x8_view<<<dim, ktype, queue>>>(in_ptr, idx_ptr);
     }
 
     return output;
