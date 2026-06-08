@@ -1,0 +1,121 @@
+// 文件名: 100_Adaptive_Max_Pool_2D.mlu
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include "framework/core/MLUStream.h"
+
+#define CHUNK_SIZE 4096
+#define CORE_NUM 4
+
+__mlu_entry__ void adaptive_max_pool_2d_kernel(
+    float *x,
+    float *output,
+    int batch,
+    int channels,
+    int H,
+    int W,
+    int out_h,
+    int out_w,
+    int total_elements) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_elements / core_num;
+    uint32_t remainder = total_elements % core_num;
+
+    uint32_t start_idx = core_id * per_core +
+                         (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_buf[CHUNK_SIZE];
+    const float NEG_INF = -1e38f;
+
+    for (uint32_t idx = 0; idx < count; ++idx) {
+        uint32_t global_idx = start_idx + idx;
+
+        // 从输出索引反推坐标 (batch, channel, out_i, out_j)
+        uint32_t out_j = global_idx % out_w;
+        uint32_t temp = global_idx / out_w;
+        uint32_t out_i = temp % out_h;
+        temp = temp / out_h;
+        uint32_t ch = temp % channels;
+        uint32_t batch_idx = temp / channels;
+
+        // 计算输入窗口范围 (左闭右开)
+        uint32_t start_h = out_i * H / out_h;
+        uint32_t end_h   = (out_i + 1) * H / out_h;
+        uint32_t start_w = out_j * W / out_w;
+        uint32_t end_w   = (out_j + 1) * W / out_w;
+        uint32_t window_w = end_w - start_w;
+
+        float max_val = NEG_INF;
+
+        for (uint32_t in_i = start_h; in_i < end_h; ++in_i) {
+            // 输入中第 in_i 行的起始偏移
+            uint32_t row_offset = ((batch_idx * channels + ch) * H + in_i) * W;
+            float row_max = NEG_INF;
+
+            // 将当前行中窗口内的数据分块加载到 NRAM，计算该行的最大值
+            for (uint32_t offset_w = 0; offset_w < window_w; offset_w += CHUNK_SIZE) {
+                uint32_t len = (offset_w + CHUNK_SIZE <= window_w) ?
+                               CHUNK_SIZE : (window_w - offset_w);
+                __memcpy(nram_buf,
+                         x + row_offset + start_w + offset_w,
+                         len * sizeof(float),
+                         GDRAM2NRAM);
+
+                for (uint32_t k = 0; k < len; ++k) {
+                    if (nram_buf[k] > row_max) row_max = nram_buf[k];
+                }
+            }
+
+            if (row_max > max_val) max_val = row_max;
+        }
+
+        output[global_idx] = max_val;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int out_h, int out_w) {
+    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(out_h > 0 && out_w > 0, "Output dimensions must be positive");
+
+    auto original_dtype = x.scalar_type();
+    torch::Tensor x_fp32 = x;
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    int batch = x_fp32.size(0);
+    int channels = x_fp32.size(1);
+    int H = x_fp32.size(2);
+    int W = x_fp32.size(3);
+
+    auto output = torch::empty(
+        {batch, channels, out_h, out_w},
+        torch::TensorOptions().dtype(torch::kFloat).device(x_fp32.device()));
+
+    int total_elements = batch * channels * out_h * out_w;
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {CORE_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    adaptive_max_pool_2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch,
+        channels,
+        H,
+        W,
+        out_h,
+        out_w,
+        total_elements);
+
+    return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "2D Adaptive Max Pool");
+}
