@@ -4,23 +4,26 @@
 
 #define ROWS 128
 #define COLS 4000
-#define CHUNK_SIZE 4096
-#define TASK_NUM 16
+#define NRAM_SIZE 4096
+#define TASK_NUM 128
 
-__mlu_entry__ void cumsum_dim1_float_kernel(
+__mlu_entry__ void cumsum_dim1_kernel(
     float* input,
     float* output,
     int rows,
     int cols
 ) {
     uint32_t tid = taskId;
-    uint32_t task_num = taskDim;
+    uint32_t ntask = taskDim;
 
-    __nram__ float buf[CHUNK_SIZE];
+    __nram__ float buf[NRAM_SIZE];
+    __nram__ float left[NRAM_SIZE];
+    __nram__ float right[NRAM_SIZE];
 
-    for (int row = tid; row < rows; row += task_num) {
+    for (int row = tid; row < rows; row += ntask) {
         int base = row * cols;
 
+        // Load one row.
         __memcpy(
             buf,
             input + base,
@@ -28,18 +31,45 @@ __mlu_entry__ void cumsum_dim1_float_kernel(
             GDRAM2NRAM
         );
 
- 
-        float sum = 0.0f;
-        float c = 0.0f;
+        for (int offset = 1; offset < cols; offset <<= 1) {
+            int valid_len = cols - offset;
+            int aligned_len = (valid_len + 63) & ~63;
 
-        for (int col = 0; col < cols; ++col) {
-            float y = buf[col] - c;
-            float t = sum + y;
-            c = (t - sum) - y;
-            sum = t;
-            buf[col] = sum;
+            // left[0 : valid_len] = old buf[0 : valid_len]
+            __memcpy(
+                left,
+                buf,
+                aligned_len * sizeof(float),
+                NRAM2NRAM
+            );
+
+            // right[0 : valid_len] = old buf[offset : offset + valid_len]
+            __memcpy(
+                right,
+                buf + offset,
+                aligned_len * sizeof(float),
+                NRAM2NRAM
+            );
+
+            // right = right + left
+            // all operands start from aligned NRAM base addresses.
+            __bang_add(
+                right,
+                right,
+                left,
+                aligned_len
+            );
+
+            // buf[offset : offset + valid_len] = right[0 : valid_len]
+            __memcpy(
+                buf + offset,
+                right,
+                aligned_len * sizeof(float),
+                NRAM2NRAM
+            );
         }
 
+        // Store only real cols elements.
         __memcpy(
             output + base,
             buf,
@@ -49,48 +79,25 @@ __mlu_entry__ void cumsum_dim1_float_kernel(
     }
 }
 
-__mlu_entry__ void cumsum_dim1_half_kernel(
-    half* input,
-    half* output,
+__mlu_entry__ void cumsum_dim0_kernel(
+    float* input,
+    float* output,
     int rows,
     int cols
 ) {
     uint32_t tid = taskId;
-    uint32_t task_num = taskDim;
+    uint32_t ntask = taskDim;
 
-    __nram__ half buf[CHUNK_SIZE];
+    // dim=0: each column has only 128 elements.
+    // This path is not the main test case, but makes the wrapper safer.
+    for (int col = tid; col < cols; col += ntask) {
+        float acc = 0.0f;
 
-    for (int row = tid; row < rows; row += task_num) {
-        int base = row * cols;
-
-        __memcpy(
-            buf,
-            input + base,
-            cols * sizeof(half),
-            GDRAM2NRAM
-        );
-
-      
-        float sum = 0.0f;
-        float c = 0.0f;
-
-        for (int col = 0; col < cols; ++col) {
-            float x = (float)buf[col];
-
-            float y = x - c;
-            float t = sum + y;
-            c = (t - sum) - y;
-            sum = t;
-
-            buf[col] = (half)sum;
+        for (int row = 0; row < rows; ++row) {
+            int idx = row * cols + col;
+            acc += input[idx];
+            output[idx] = acc;
         }
-
-        __memcpy(
-            output + base,
-            buf,
-            cols * sizeof(half),
-            NRAM2GDRAM
-        );
     }
 }
 
@@ -98,36 +105,50 @@ torch::Tensor bang_func(
     torch::Tensor input,
     int dim
 ) {
-    TORCH_CHECK(input.dim() == 2, "cumsum.mlu only supports 2D input for this problem.");
-    TORCH_CHECK(dim == 1 || dim == -1, "cumsum.mlu only supports dim = 1.");
+    TORCH_CHECK(input.dim() == 2, "This cumsum implementation only supports 2D input.");
     TORCH_CHECK(input.size(0) == ROWS, "Expected input.size(0) == 128.");
     TORCH_CHECK(input.size(1) == COLS, "Expected input.size(1) == 4000.");
 
-    torch::Tensor x = input.contiguous();
-    torch::Tensor output = torch::empty_like(x);
+    int real_dim = dim;
+    if (real_dim < 0) {
+        real_dim += 2;
+    }
+
+    TORCH_CHECK(real_dim == 0 || real_dim == 1, "dim must be 0 or 1.");
+
+    auto original_dtype = input.scalar_type();
+
+    torch::Tensor input_fp32 = input.contiguous();
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input_fp32.to(torch::kFloat);
+    }
+
+    torch::Tensor output_fp32 = torch::empty_like(input_fp32);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t k_dim = {TASK_NUM, 1, 1};
     cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
 
-    if (x.scalar_type() == torch::kFloat || x.scalar_type() == torch::kFloat32) {
-        cumsum_dim1_float_kernel<<<k_dim, k_type, queue>>>(
-            x.data_ptr<float>(),
-            output.data_ptr<float>(),
-            ROWS,
-            COLS
-        );
-    } else if (x.scalar_type() == torch::kHalf || x.scalar_type() == torch::kFloat16) {
-        cumsum_dim1_half_kernel<<<k_dim, k_type, queue>>>(
-            reinterpret_cast<half*>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+    if (real_dim == 1) {
+        cumsum_dim1_kernel<<<k_dim, k_type, queue>>>(
+            input_fp32.data_ptr<float>(),
+            output_fp32.data_ptr<float>(),
             ROWS,
             COLS
         );
     } else {
-        TORCH_CHECK(false, "cumsum.mlu only supports float32 and float16 input.");
+        cumsum_dim0_kernel<<<k_dim, k_type, queue>>>(
+            input_fp32.data_ptr<float>(),
+            output_fp32.data_ptr<float>(),
+            ROWS,
+            COLS
+        );
     }
 
-    return output;
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
 }
