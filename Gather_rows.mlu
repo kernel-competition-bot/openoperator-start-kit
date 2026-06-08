@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_39_loadgdram_t64_union1
+// 110_Gather_rows v110_40_gather_async_block8_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_39_loadgdram_t64_union1"
+#warning "BUILD_VERSION v110_40_gather_async_block8_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,94 +12,128 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TASK_DIM 64
 
-#define DO_FLOAT(K) do {                                      \
-    int idx = __load_gdram(index32 + ((idx_base + (K)) * 2));  \
-    out_buf[(K)] = __load_gdram(input + in_base + idx);        \
-} while (0)
+#define ROW_BLOCK 8
+#define TASK_DIM 4
 
-#define DO_HALF(K) do {                                       \
-    int idx = __load_gdram(index32 + ((idx_base + (K)) * 2));  \
-    out_buf[(K)] = __load_gdram(input + in_base + idx);        \
-} while (0)
+#define INDEX_ELEMS  (ROW_BLOCK * K_COL)
+#define OUTPUT_ELEMS (ROW_BLOCK * K_COL)
 
-#define DO_ALL_FLOAT() do { \
-    DO_FLOAT(0);  DO_FLOAT(1);  DO_FLOAT(2);  DO_FLOAT(3);  \
-    DO_FLOAT(4);  DO_FLOAT(5);  DO_FLOAT(6);  DO_FLOAT(7);  \
-    DO_FLOAT(8);  DO_FLOAT(9);  DO_FLOAT(10); DO_FLOAT(11); \
-    DO_FLOAT(12); DO_FLOAT(13); DO_FLOAT(14); DO_FLOAT(15); \
-    DO_FLOAT(16); DO_FLOAT(17); DO_FLOAT(18); DO_FLOAT(19); \
-    DO_FLOAT(20); DO_FLOAT(21); DO_FLOAT(22); DO_FLOAT(23); \
-    DO_FLOAT(24); DO_FLOAT(25); DO_FLOAT(26); DO_FLOAT(27); \
-    DO_FLOAT(28); DO_FLOAT(29); DO_FLOAT(30); DO_FLOAT(31); \
-} while (0)
-
-#define DO_ALL_HALF() do { \
-    DO_HALF(0);  DO_HALF(1);  DO_HALF(2);  DO_HALF(3);  \
-    DO_HALF(4);  DO_HALF(5);  DO_HALF(6);  DO_HALF(7);  \
-    DO_HALF(8);  DO_HALF(9);  DO_HALF(10); DO_HALF(11); \
-    DO_HALF(12); DO_HALF(13); DO_HALF(14); DO_HALF(15); \
-    DO_HALF(16); DO_HALF(17); DO_HALF(18); DO_HALF(19); \
-    DO_HALF(20); DO_HALF(21); DO_HALF(22); DO_HALF(23); \
-    DO_HALF(24); DO_HALF(25); DO_HALF(26); DO_HALF(27); \
-    DO_HALF(28); DO_HALF(29); DO_HALF(30); DO_HALF(31); \
-} while (0)
-
-__mlu_entry__ void gather_rows_float_loadgdram_union1_kernel(
+__mlu_entry__ void gather_rows_float_gather_async_block8_kernel(
     const float *input,
     const int64_t *index,
     float *output
 ) {
-#ifdef __BANG_ARCH__
-    if (__is_mpu()) return;
-#endif
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
 
-    uint32_t b = taskId;
-    if (b >= BATCH) return;
+    __nram__ int64_t idx_buf[INDEX_ELEMS];
+    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+    __nram__ float out_buf[OUTPUT_ELEMS];
 
-    const int32_t *index32 = (const int32_t *)index;
+    int num_blocks = BATCH / ROW_BLOCK;  // 8
 
-    __nram__ float out_buf[K_COL];
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
 
-    int in_base = b * N_COL;
-    int idx_base = b * K_COL;
-    int out_base = b * K_COL;
+        const float *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        float *out_ptr = output + b0 * K_COL;
 
-    DO_ALL_FLOAT();
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_ELEMS * sizeof(int64_t),
+                 GDRAM2NRAM);
 
-    __memcpy(output + out_base,
-             out_buf,
-             K_COL * sizeof(float),
-             NRAM2GDRAM);
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+
+                // float block8 最大 byte offset:
+                // (7 * 1024 + 1023) * 4 = 32764
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(float));
+            }
+        }
+
+        __gather_async(out_buf,
+                       input_ptr,
+                       off_buf,
+                       sizeof(float),
+                       GDRAM2NRAM,
+                       sizeof(float),
+                       OUTPUT_ELEMS);
+
+        // async gather 写 out_buf；output copy 前必须同步 IO/MOVE/COMPUTE
+        __sync_io_move_compute();
+
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_ELEMS * sizeof(float),
+                 NRAM2GDRAM);
+    }
 }
 
-__mlu_entry__ void gather_rows_half_loadgdram_union1_kernel(
+__mlu_entry__ void gather_rows_half_gather_async_block8_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
-#ifdef __BANG_ARCH__
-    if (__is_mpu()) return;
-#endif
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
 
-    uint32_t b = taskId;
-    if (b >= BATCH) return;
+    __nram__ int64_t idx_buf[INDEX_ELEMS];
+    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+    __nram__ half out_buf[OUTPUT_ELEMS];
 
-    const int32_t *index32 = (const int32_t *)index;
+    int num_blocks = BATCH / ROW_BLOCK;  // 8
 
-    __nram__ half out_buf[K_COL];
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
 
-    int in_base = b * N_COL;
-    int idx_base = b * K_COL;
-    int out_base = b * K_COL;
+        const half *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        half *out_ptr = output + b0 * K_COL;
 
-    DO_ALL_HALF();
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_ELEMS * sizeof(int64_t),
+                 GDRAM2NRAM);
 
-    __memcpy(output + out_base,
-             out_buf,
-             K_COL * sizeof(half),
-             NRAM2GDRAM);
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(half));
+            }
+        }
+
+        __gather_async(out_buf,
+                       input_ptr,
+                       off_buf,
+                       sizeof(half),
+                       GDRAM2NRAM,
+                       sizeof(half),
+                       OUTPUT_ELEMS);
+
+        __sync_io_move_compute();
+
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_ELEMS * sizeof(half),
+                 NRAM2GDRAM);
+    }
 }
 
 torch::Tensor bang_func(torch::Tensor input,
@@ -109,18 +143,16 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t dim = {TASK_DIM, 1, 1};
-
-    // Union1 要求 dim.x 是 4 的倍数；64 满足
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_half_loadgdram_union1_kernel<<<dim, ktype, queue>>>(
+        gather_rows_half_gather_async_block8_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else {
-        gather_rows_float_loadgdram_union1_kernel<<<dim, ktype, queue>>>(
+        gather_rows_float_gather_async_block8_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
