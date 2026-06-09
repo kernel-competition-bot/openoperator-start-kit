@@ -25,7 +25,6 @@ __mlu_entry__ void mse_kernel(
     __nram__ float nram_pred[CHUNK_SIZE];
     __nram__ float nram_targ[CHUNK_SIZE];
     __nram__ float nram_diff[CHUNK_SIZE];
-    __nram__ float nram_dot[1];
 
     float local_sum = 0.0f;
 
@@ -59,13 +58,15 @@ __mlu_entry__ void mse_kernel(
             nram_targ,
             CHUNK_SIZE);
 
-        __bang_sdot(
-            nram_dot,
+        __bang_mul(
+            nram_diff,
             nram_diff,
             nram_diff,
             CHUNK_SIZE);
 
-        local_sum += nram_dot[0];
+        for (uint32_t i = 0; i < len; i++) {
+            local_sum += nram_diff[i];
+        }
     }
 
     output[core_id] = local_sum;
