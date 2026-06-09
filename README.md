@@ -1,76 +1,114 @@
 # openoperator-start-kit
 
-赛事官网->https://openoperator.cn
+OpenOperator 竞赛模板仓库 —— 为 Cambricon MLU370 加速卡编写 BANG C 算子。
 
-快捷监控->http://152.136.18.42:13000
+竞赛官网: https://openoperator.cn
 
-此仓库是openoperator赛事举办方提供的模板仓库。选手可以直接Fork此仓库作为自己队伍的仓库。
+## 项目简介
 
-## Quick Start
+本仓库是 OpenOperator 竞赛的起点模板。参赛者 Fork 此仓库后，编写 BANG C 算子内核（`.mlu` 文件），推送至 `main` 分支，远程评测服务器会自动评分并更新排行榜。
 
-1. Fork此仓库，将仓库可见范围设置为private，将bot帐号加入collaborators
-2. 点击`settings`->`webhooks`->`Add webhook`，配置webhook
-   1. `Payload URL`填写`http://152.136.18.42:8000/webhook`
-   2. `Content type`选择`application/json`
-   3. `Secret`填写分配到的密钥（参赛信息收集完成后会分发随机的`webhook secret`）
-   4. `SSL verification`选择`Disable`
-   5. `Which events...`选择`Just the push event`
-   6. 勾选`Active`
-   7. 点击`Add webhook`
-3. Clone仓库，随便在README.md中写点什么
-4. 使用`git push`将修改推送到`github`，恭喜你完成了第一次代码提交！
-5. 点开`xx Commits`提交记录页面，边刷新边等待一会，如果系统此时不太忙碌，大约1～3分钟后你就可以在该次提交的评论处看到系统反馈的结果和运行日志。
+- **硬件目标**: Cambricon MLU370
+- **编程语言**: BANG C (类似 CUDA 的 C 方言)
+- **SDK**: Neuware SDK (CNToolkit + CNRT)
+- **Python 运行时**: Cambricon 定制版 PyTorch 2.1.0 + torch_mlu
 
-## 提交说明
+## 目录结构
 
-### 流程说明
-
-配置好webhook后，当仓库发生push操作，github会向远程服务器发送提交信息。远程仓库检查webhook secret有效性后，拉取仓库更新，执行评估脚本。无论结果如何，执行结束后该次commit评论区会收到日志。如果该次提交的某道题目跑分优于你在该道题目上的历史最好成绩，排行榜的该道题目成绩会更新（排行榜检查是否有新的最好成绩的间隔为5分钟）。
-
-### 仓库结构
-
-提交时仓库根目录需要包含`config`文件和题目的`mlu`代码文件。文件组织结构如下
-
-```bash
+```
 .
-├── config			# 配置文件，用于指定要评估的题目
-├── LeakyReLU.mlu	# bangc代码文件，必须包含kernel函数定义和用于外部程序调用的函数定义
-├── ...				# 其他题目的bangc代码文件
-└── README.md		# 可选的代码说明
+├── config            # 指定需要评测的题目 ID（三位数编码）
+├── Makefile          # 使用 cncc 编译 .mlu 文件
+├── test_ops.py       # 本地测试脚本
+├── requirements.txt  # 依赖说明文档（非 pip 安装）
+├── .gitignore
+├── .vscode/
+│   └── settings.json # VS Code 配置：将 .mlu 识别为 C++
+├── LeakyReLU.mlu     # 001 LeakyReLU 算子
+├── 070_Sqrt.mlu      # 070 Sqrt 算子
+└── 103_MSE_Loss.mlu  # 103 MSE Loss 算子
 ```
 
-> [!NOTE]
->
-> 通过`config`文件可以指定本次提交想要评估的题目范围
-> config文件的每行代表一个题目，应按照题目序号的三位数字给出
-> 例如，LeakyReLU的序号是001，为了评估LeakyReLU题目，config中必须包含一行`001`
+## 环境要求
 
-> [!TIP]
->
-> 每道题目的评估耗时预计不少于30s，评估系统评估完所有题目后才会返回结果，请合理安排评估请求，尽量不要一次性评估太多题目。
+安装 Cambricon Neuware SDK 后，还需安装定制版 PyTorch:
 
-> [!CAUTION]
->
-> 如果提交中不包含config文件，则会默认评估所有题目！
+1. Neuware SDK (CNToolkit) —— 系统级安装，提供 `cncc` 编译器
+2. Cambricon 定制 PyTorch wheel: `torch-2.1.0-cp310-linux_x86_64.whl`
+3. Cambricon 定制 torch_mlu wheel: `torch_mlu-*.whl`
 
-### 代码要求
+## 快速开始
 
-1. 代码文件必须以题目名称命名，这是评估脚本能找到你代码的关键要求。
-2. 代码中要覆盖头文件引用，核函数定义和用于外部调用的函数定义。
-3. 用于外部调用的函数名必须设置为bang_func，bang_func的返回值为`torch::Tensor`，输入参数包含`torch::Tensor input`和参考代码中`__init__`部分定义的其他参数，请参考LeakyReLU示例进行理解。
+### 编译
 
-## 题目&打分
+```bash
+make          # 编译 config 中列出的 .mlu 文件
+make all      # 编译全部 .mlu 文件
+make check    # 验证编译环境（检查 cncc 和 MLU 设备）
+make clean    # 清除编译产物 (*.o)
+```
 
-题目按照类别分为`basic`，`easy`，`medium`，`hard`。其中`basic`是必做题，其他类为挑战题。
+### 本地测试
 
-打分有两个指标：
+```bash
+python3 test_ops.py              # 测试 config 中的题目
+python3 test_ops.py --all        # 测试所有已注册的算子
+python3 test_ops.py LeakyReLU    # 按名称测试
+python3 test_ops.py 001 070      # 按题目编号测试
+```
 
-- 算子结果必须与参考结果误差不大于1e-2，精度达标后性能评估结果才有效
-- 性能分数按照`bangc`代码硬件时间相对于`torch`的执行时间赋值
+测试脚本会将 BANG C 算子的输出与 PyTorch CPU 参考实现对比，报告最大绝对误差和加速比。
 
-## 最佳实践
+### 远程评测
 
-1. 每次只评估少量题目
-2. 尽量在调试服务器debug，远程评估时通过阅读commit评论中的报错进行debug
-3. 系统只接收`main`分支的提交，所以请分时开发或者做好分支管理
-4. github评论是执行结束第一时间更新的，快捷监控可以查看目前评估进度，排行榜是周期性更新的，且只会记录团队历史最好成绩
+1. Fork 本仓库并设为 **私有**
+2. 将竞赛评测机器人添加为协作者
+3. 配置 GitHub Webhook 指向 `http://152.136.18.42:8000/webhook`
+4. 编写并推送代码到 `main` 分支
+5. 约 1-3 分钟后，评测结果将以评论形式出现在对应 commit 上
+6. 排行榜每 5 分钟更新一次，取每位选手的最高得分
+
+## 编写算子
+
+每个 `.mlu` 文件需包含:
+
+1. **`__mlu_entry__` 内核函数** —— 运行在 MLU 核心上的 BANG C 代码
+2. **`bang_func(...)` 函数** —— 供 PyTorch 调用的 C++ 入口
+
+核心编程模式:
+
+```cpp
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+// 多核任务分发：taskId 标识当前核心，taskDim 为 {4,1,1}
+// NRAM 分块：CHUNK_SIZE = 4096
+// 数据搬运：__memcpy 实现 GDRAM <-> NRAM 传输
+// 内核启动：通过 cnrtQueue_t 流启动
+```
+
+### BANG C 常用 API
+
+| 功能 | API |
+|---|---|
+| 元素级运算 | `__bang_add`, `__bang_mul`, `__bang_active_relu` 等 |
+| 数据搬运 | `__memcpy` (GDRAM ↔ NRAM) |
+| 规约操作 | `__bang_reduce_sum` 等 (配合 SRAM) |
+| 类型转换 | `__bang_float2half`, `__bang_half2float` 等 |
+
+## 自定义评测范围
+
+修改 `config` 文件，每行一个三位数题目 ID:
+
+```
+001
+070
+103
+```
+
+若 `config` 文件不存在，远程评测服务器将评测所有题目。
+
+## License
+
+本项目仅供 OpenOperator 竞赛使用。

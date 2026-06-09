@@ -1,0 +1,12 @@
+# MLU 编译产物
+*.o
+*.so
+*.wrapper.cpp
+
+# Python
+__pycache__/
+*.pyc
+
+.vscode/
+AGENTS.md
+

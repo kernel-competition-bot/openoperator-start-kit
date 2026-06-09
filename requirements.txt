@@ -1,0 +1,16 @@
+# 寒武纪 MLU370 算子开发环境
+
+# 核心依赖 (需要在 MLU370 服务器上安装)
+# 安装顺序:
+# 1. CNToolkit (Neuware SDK) - 系统级安装, 包含 cncc 编译器、CNRT 运行时
+#    下载: https://forum.cambricon.com (需注册寒武纪开发者账号)
+#
+# 2. 寒武纪定制版 PyTorch
+#    pip install torch-2.1.0-cp310-cp310-linux_x86_64.whl
+#
+# 3. torch_mlu
+#    pip install torch_mlu-{version}+torch2.1.0-cp310-cp310-linux_x86_64.whl
+
+# 本地测试脚本用 (在 MLU 服务器上运行)
+# torch          # 寒武纪定制版 wheel, 非 PyPI 版本
+# torch_mlu      # 寒武纪定制版 wheel, 非 PyPI 版本

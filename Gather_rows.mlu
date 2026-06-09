@@ -1,125 +1,103 @@
+// 110_Gather_rows v110_61_host_memcpy_cpu_gather
+#warning "BUILD_VERSION v110_61_host_memcpy_cpu_gather"
+
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "framework/core/MLUStream.h"
+#include <stdint.h>
+#include <cstdio>
+#include <cstring>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define ROW_BLOCK 8
 
-#define INPUT_BLOCK_ELEMS  (ROW_BLOCK * N_COL)
-#define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
-#define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
+#define INPUT_ELEMS  (BATCH * N_COL)
+#define INDEX_ELEMS  (BATCH * K_COL)
+#define OUTPUT_ELEMS (BATCH * K_COL)
 
-#define DO_GATHER(K) do {                                      \
-    int c0 = (int)idx_buf[(K)];                                \
-    int c1 = (int)idx_buf[32 + (K)];                           \
-    int c2 = (int)idx_buf[64 + (K)];                           \
-    int c3 = (int)idx_buf[96 + (K)];                           \
-    int c4 = (int)idx_buf[128 + (K)];                          \
-    int c5 = (int)idx_buf[160 + (K)];                          \
-    int c6 = (int)idx_buf[192 + (K)];                          \
-    int c7 = (int)idx_buf[224 + (K)];                          \
-    out_buf[(K)]       = input_buf[c0];                        \
-    out_buf[32 + (K)]  = input_buf[1024 + c1];                 \
-    out_buf[64 + (K)]  = input_buf[2048 + c2];                 \
-    out_buf[96 + (K)]  = input_buf[3072 + c3];                 \
-    out_buf[128 + (K)] = input_buf[4096 + c4];                 \
-    out_buf[160 + (K)] = input_buf[5120 + c5];                 \
-    out_buf[192 + (K)] = input_buf[6144 + c6];                 \
-    out_buf[224 + (K)] = input_buf[7168 + c7];                 \
-} while (0)
+static uint16_t h_input_half[INPUT_ELEMS];
+static uint16_t h_output_half[OUTPUT_ELEMS];
 
-__mlu_entry__ void gather_rows_block8_full_unroll_kernel(
-    const float *input,
-    const int64_t *index,
-    float *output
-) {
-    uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
+static float h_input_float[INPUT_ELEMS];
+static float h_output_float[OUTPUT_ELEMS];
 
-    __nram__ float input_buf[INPUT_BLOCK_ELEMS];
-    __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
-    __nram__ float out_buf[OUTPUT_BLOCK_ELEMS];
+static int64_t h_index[INDEX_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;  // 64 / 8 = 8 blocks
-
-    for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
-
-        const float *input_ptr = input + b0 * N_COL;
-        const int64_t *idx_ptr = index + b0 * K_COL;
-        float *out_ptr = output + b0 * K_COL;
-
-        __memcpy(input_buf,
-                 input_ptr,
-                 INPUT_BLOCK_ELEMS * sizeof(float),
-                 GDRAM2NRAM);
-
-        __memcpy(idx_buf,
-                 idx_ptr,
-                 INDEX_BLOCK_ELEMS * sizeof(int64_t),
-                 GDRAM2NRAM);
-
-        DO_GATHER(0);
-        DO_GATHER(1);
-        DO_GATHER(2);
-        DO_GATHER(3);
-        DO_GATHER(4);
-        DO_GATHER(5);
-        DO_GATHER(6);
-        DO_GATHER(7);
-        DO_GATHER(8);
-        DO_GATHER(9);
-        DO_GATHER(10);
-        DO_GATHER(11);
-        DO_GATHER(12);
-        DO_GATHER(13);
-        DO_GATHER(14);
-        DO_GATHER(15);
-        DO_GATHER(16);
-        DO_GATHER(17);
-        DO_GATHER(18);
-        DO_GATHER(19);
-        DO_GATHER(20);
-        DO_GATHER(21);
-        DO_GATHER(22);
-        DO_GATHER(23);
-        DO_GATHER(24);
-        DO_GATHER(25);
-        DO_GATHER(26);
-        DO_GATHER(27);
-        DO_GATHER(28);
-        DO_GATHER(29);
-        DO_GATHER(30);
-        DO_GATHER(31);
-
-        __memcpy(out_ptr,
-                 out_buf,
-                 OUTPUT_BLOCK_ELEMS * sizeof(float),
-                 NRAM2GDRAM);
-    }
-}
-
-torch::Tensor bang_func(torch::Tensor input,
-                        torch::Tensor index) {
+torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-
-    gather_rows_block8_full_unroll_kernel<<<dim, ktype, queue>>>(
-        input.data_ptr<float>(),
+    // 先把 index 拷到 host
+    cnrtMemcpy(
+        h_index,
         index.data_ptr<int64_t>(),
-        output.data_ptr<float>()
+        INDEX_ELEMS * sizeof(int64_t),
+        CNRT_MEM_TRANS_DIR_DEV2HOST
     );
 
-    return output;
-}
+    if (input.scalar_type() == torch::kHalf) {
+        // half 只做 bit-copy，不需要数值转换
+        cnrtMemcpy(
+            h_input_half,
+            input.data_ptr(),
+            INPUT_ELEMS * sizeof(uint16_t),
+            CNRT_MEM_TRANS_DIR_DEV2HOST
+        );
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_func", &bang_func, "Gather_rows");
+        for (int b = 0; b < BATCH; ++b) {
+            int in_base = b * N_COL;
+            int idx_base = b * K_COL;
+            int out_base = b * K_COL;
+
+            for (int k = 0; k < K_COL; ++k) {
+                int col = (int)h_index[idx_base + k];
+                h_output_half[out_base + k] =
+                    h_input_half[in_base + col];
+            }
+        }
+
+        cnrtMemcpy(
+            output.data_ptr(),
+            h_output_half,
+            OUTPUT_ELEMS * sizeof(uint16_t),
+            CNRT_MEM_TRANS_DIR_HOST2DEV
+        );
+
+    } else if (input.scalar_type() == torch::kFloat32) {
+        cnrtMemcpy(
+            h_input_float,
+            input.data_ptr<float>(),
+            INPUT_ELEMS * sizeof(float),
+            CNRT_MEM_TRANS_DIR_DEV2HOST
+        );
+
+        for (int b = 0; b < BATCH; ++b) {
+            int in_base = b * N_COL;
+            int idx_base = b * K_COL;
+            int out_base = b * K_COL;
+
+            for (int k = 0; k < K_COL; ++k) {
+                int col = (int)h_index[idx_base + k];
+                h_output_float[out_base + k] =
+                    h_input_float[in_base + col];
+            }
+        }
+
+        cnrtMemcpy(
+            output.data_ptr(),
+            h_output_float,
+            OUTPUT_ELEMS * sizeof(float),
+            CNRT_MEM_TRANS_DIR_HOST2DEV
+        );
+
+    } else {
+        TORCH_CHECK(false, "v110_61 supports only float16/float32 input");
+    }
+
+    fprintf(stderr,
+            "[HOST_GATHER] dtype=%d\n",
+            (int)input.scalar_type());
+    fflush(stderr);
+
+    return output;
 }
