@@ -70,10 +70,10 @@ OPS_META = {
     },
     "PointwiseConv2d": {
         "file": "104_PointwiseConv2d.mlu",
-        "args": ["x", "weight", "bias"],
-        "ref": lambda x, w, b=None: torch.nn.functional.conv2d(x, w, b),
+        "args": ["x", "weight"],
+        "ref": lambda x, w, bias=None: torch.nn.functional.conv2d(x, w, bias),
         "shape": [(2, 64, 32, 32), (128, 64, 1, 1)],
-        "extra": {"bias": None},
+        "extra": {},
     },
 }
 
@@ -259,7 +259,7 @@ def test_operator(name, meta, device="mlu"):
     with torch.no_grad():
         t0 = time.perf_counter()
         for _ in range(N_ITER):
-            result_ref = ref_fn(*inputs_cpu, **extra)
+            result_ref = ref_fn(*inputs_cpu, *extra_vals)
         torch_time_ms = (time.perf_counter() - t0) / N_ITER * 1000
 
     # 精度对比
