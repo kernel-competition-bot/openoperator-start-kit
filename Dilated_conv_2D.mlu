@@ -23,11 +23,12 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int dilation_w)
 {
     // ========================================================================
-    // 多核拆分: 按 (batch, output_channel) 组合拆分
+    // 多核拆分: 按 (batch, output_channel, output_height) 组合拆分
+    // 确保每个核处理更少的工作，提高精度
     // ========================================================================
     uint32_t core_id  = taskId;
     uint32_t core_num = taskDim;
-    uint32_t total_tasks = (uint32_t)(N * C_out);
+    uint32_t total_tasks = (uint32_t)(N * C_out * H_out);
     uint32_t per_core  = total_tasks / core_num;
     uint32_t remainder = total_tasks % core_num;
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
@@ -36,150 +37,68 @@ __mlu_entry__ void dilated_conv2d_kernel(
     // 各维度步长
     int in_batch_stride   = C_in * H * W;
     int in_channel_stride = H * W;
+    int in_row_stride     = W;
     int w_oc_stride       = C_in * kH * kW;
     int w_ic_stride       = kH * kW;
     int out_batch_stride  = C_out * H_out * W_out;
     int out_oc_stride     = H_out * W_out;
+    int out_row_stride    = W_out;
 
-    // ---- NRAM 缓冲区 ----
-    int tile_h = H;
-    while ((tile_h * W > 16384 || tile_h * W_out > 16384) && tile_h > 1) {
-        tile_h /= 2;
-    }
-
-    __nram__ float nram_in[16384];       // 输入通道 tile
-    __nram__ float nram_out[16384];      // 输出 tile 累加器
-    __nram__ float nram_tmp[4096];       // 临时缓冲 (与原始代码相同)
+    // NRAM 缓冲区
+    __nram__ float nram_out_row[256];  // 单行输出累加器
 
     // ========================================================================
-    // 每个 core 处理分配给它的 (n, oc) 对
+    // 每个 core 处理分配给它的 (n, oc, oh) 三元组
     // ========================================================================
     for (uint32_t t = 0; t < count; t++) {
         uint32_t task_idx = start + t;
-        int n  = (int)(task_idx / (uint32_t)C_out);
-        int oc = (int)(task_idx % (uint32_t)C_out);
+        int n  = (int)(task_idx / (uint32_t)(C_out * H_out));
+        int rem = (int)(task_idx % (uint32_t)(C_out * H_out));
+        int oc = rem / H_out;
+        int oh = rem % H_out;
 
-        // 当前 (n, oc) 的 GDRAM 输出基址
-        float* out_gdram = output + n * out_batch_stride + oc * out_oc_stride;
+        // 清零当前输出行
+        __bang_write_zero(nram_out_row, 256);
 
-        // 按 tile_h 分块处理 H 维度
-        for (int oh_tile_start = 0; oh_tile_start < H_out; oh_tile_start += tile_h) {
-            int oh_tile_end = oh_tile_start + tile_h;
-            if (oh_tile_end > H_out) oh_tile_end = H_out;
-            int cur_tile_h = oh_tile_end - oh_tile_start;
-            int out_tile_size = cur_tile_h * W_out;
+        // 对每个输出列 ow
+        for (int ow = 0; ow < W_out; ow++) {
+            float sum = 0.0f;
 
-            // 清零输出 tile 累加器
-            __bang_write_zero(nram_out, out_tile_size);
-
-            // ---- 遍历所有输入通道 ic ----
+            // 遍历所有输入通道
             for (int ic = 0; ic < C_in; ic++) {
-                // 该输入通道的 GDRAM 基址
-                const float* in_ch_base = input + n * in_batch_stride + ic * in_channel_stride;
+                // 遍历 kernel 的所有元素
+                for (int kh = 0; kh < kH; kh++) {
+                    int ih = oh * stride_h + kh * dilation_h - padding_h;
 
-                // 加载该 ic 下需要的输入行到 NRAM (逐行 DMA, 原始方式)
-                int load_ih_start = oh_tile_start * stride_h - padding_h;
-                if (load_ih_start < 0) load_ih_start = 0;
-                int load_ih_end = (oh_tile_end - 1) * stride_h + (kH - 1) * dilation_h - padding_h + 1;
-                if (load_ih_end > H) load_ih_end = H;
-                int num_in_rows = load_ih_end - load_ih_start;
+                    for (int kw = 0; kw < kW; kw++) {
+                        int iw = ow * stride_w + kw * dilation_w - padding_w;
 
-                for (int ih = load_ih_start; ih < load_ih_end; ih++) {
-                    int nram_row = ih - load_ih_start;
-                    __memcpy(nram_in + nram_row * W, in_ch_base + ih * W, W * sizeof(float), GDRAM2NRAM);
-                }
+                        // 检查输入坐标是否有效
+                        if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                            // 计算线性索引
+                            int in_idx = n * in_batch_stride + ic * in_channel_stride + ih * in_row_stride + iw;
+                            int w_idx = oc * w_oc_stride + ic * w_ic_stride + kh * kW + kw;
 
-                // 该 oc, ic 对应的权重基址
-                const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
-
-                float* nram_row_acc = nram_tmp;
-                float* nram_row_tmp_c = nram_tmp + 128;
-
-                // ---- 逐输出行处理 ----
-                for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
-                    int nram_out_row = oh - oh_tile_start;
-
-                    // 清零行累加器
-                    __bang_write_zero(nram_row_acc, W_out);
-
-                    // 遍历 (kh, kw)
-                    for (int kh = 0; kh < kH; kh++) {
-                        int ih = oh * stride_h + kh * dilation_h - padding_h;
-                        if (ih < 0 || ih >= H) continue;
-
-                        int nram_in_row = ih - load_ih_start;
-
-                        for (int kw = 0; kw < kW; kw++) {
-                            float w_val = w_base[kh * kW + kw];
-                            if (w_val == 0.0f) continue;
-
-                            int iw_offset = kw * dilation_w - padding_w;
-                            int ow_start = 0 - iw_offset;
-                            if (ow_start < 0) ow_start = 0;
-                            int ow_end = W - iw_offset;
-                            if (ow_end > W_out) ow_end = W_out;
-                            int valid_w = ow_end - ow_start;
-                            if (valid_w <= 0) continue;
-
-                            int iw_start = ow_start + iw_offset;
-
-                            // -----------------------------------------------
-                            // 核心修复: 仅在会跨行时用标量, 其余用向量
-                            // -----------------------------------------------
-                            if (iw_start + valid_w <= W) {
-                                // 行内完整, 向量操作
-                                __bang_mul_scalar(nram_row_tmp_c, nram_in + nram_in_row * W + iw_start, w_val, valid_w);
-                                __bang_add(nram_row_acc + ow_start, nram_row_acc + ow_start, nram_row_tmp_c, valid_w);
-                            } else {
-                                // 可能跨行, 标量操作
-                                for (int i = 0; i < valid_w; i++) {
-                                    nram_row_acc[ow_start + i] += w_val * nram_in[nram_in_row * W + iw_start + i];
-                                }
-                            }
+                            // 标量读取和乘加，确保最高精度
+                            float in_val = input[in_idx];
+                            float w_val = weight[w_idx];
+                            sum += in_val * w_val;
                         }
+                        // 否则输入为 0，不贡献
                     }
-
-                    // 累加到 nram_out
-                    __bang_add(nram_out + nram_out_row * W_out, nram_out + nram_out_row * W_out, nram_row_acc, W_out);
                 }
             }
 
-            // ---- 写回 GDRAM ----
-            __memcpy(out_gdram + oh_tile_start * W_out, nram_out, out_tile_size * sizeof(float), NRAM2GDRAM);
+            // 写入输出
+            nram_out_row[ow] = sum;
         }
+
+        // 计算输出地址并写回 GDRAM
+        int out_idx = n * out_batch_stride + oc * out_oc_stride + oh * out_row_stride;
+        __memcpy(output + out_idx, nram_out_row, W_out * sizeof(float), NRAM2GDRAM);
     }
 }
 
-
-/* ============================================================================
- * bang_func — 外部调用接口
- *
- * 严格匹配 C++ Wrapper 签名:
- *   torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
- *       int in_channels, int out_channels, int kernel_size,
- *       int dilation, int padding);
- *
- * 内部行为与 PyTorch nn.Conv2d 对齐:
- *   - stride = 1 (默认)
- *   - bias = False (无偏置)
- *   - dilation / padding 为方形参数
- *   - 空洞卷积输出尺寸公式:
- *     H_out = (H + 2*pad - dil*(K-1) - 1) / stride + 1
- *     W_out = (W + 2*pad - dil*(K-1) - 1) / stride + 1
- *
- * 参数:
- *   x:           输入张量，形状 [batch, in_channels, H, W]
- *   kernel:      卷积核张量，形状 [out_channels, in_channels, K, K]
- *   in_channels: 输入通道数
- *   out_channels:输出通道数
- *   kernel_size: 卷积核尺寸 K
- *   dilation:    空洞系数
- *   padding:     填充宽度
- *
- * 返回值:
- *   卷积输出张量，形状 [batch, out_channels, H_out, W_out]
- * ============================================================================
- */
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor kernel,
@@ -241,7 +160,7 @@ torch::Tensor bang_func(
     // -------- 获取 MLU Stream 并启动 Kernel --------
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 使用 cnrtFuncTypeBlock + 16 个任务，充分利用 MLU370 的 16 个核心
+    // 使用 cnrtFuncTypeBlock + 16 个任务
     cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
