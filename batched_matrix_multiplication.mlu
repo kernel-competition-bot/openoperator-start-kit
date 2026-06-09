@@ -2,7 +2,10 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define MAX_MATRIX_ELEMS 65536
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 128
+#define FIX_POSITION 0
 
 /* ============================================================================
  * Batched Matrix Multiplication
@@ -11,17 +14,15 @@
  * B: [batch_size, k, n]
  * C: [batch_size, m, n]
  *
- * 使用教程 05_matmul 中的 __bang_conv 映射实现 float32 矩阵乘法。
- * A/B/C 按 k 和 m 维分块，避免大矩阵一次性搬入 NRAM/WRAM。
- * B 的每个 k tile 按教程 conv filter 布局重排到 WRAM。
- * Conv 输出布局为 [n, tile_m, 1]，写回时转置为目标 [m, n]。
+ * 使用教程 05_matmul 中的 __bang_matmul 实现 float16 输入矩阵乘法。
+ * B 的 tile 在 WRAM 中转为列主序，输出 partial float 并在 GDRAM 中累加。
  * 返回前转换为 float16，满足题目数据格式要求。
  * ============================================================================
  */
-__mlu_entry__ void batched_matmul_conv_kernel(
+__mlu_entry__ void batched_matmul_half_kernel(
     float *C,
-    const float *A,
-    const float *B,
+    const half *A,
+    const half *B,
     int batch_size,
     int m,
     int k,
@@ -37,109 +38,70 @@ __mlu_entry__ void batched_matmul_conv_kernel(
     uint32_t count = per_task +
                      (task_id < remainder ? 1 : 0);
 
-    __nram__ float nram_A[MAX_MATRIX_ELEMS];
-    __wram__ float wram_B[MAX_MATRIX_ELEMS];
-    __nram__ float nram_out_trans[MAX_MATRIX_ELEMS];
+    __nram__ half nram_A[TILE_M * TILE_K];
+    __wram__ half wram_B_col[TILE_N * TILE_K];
+    __nram__ float nram_C[TILE_M * TILE_N];
 
     int a_elems = m * k;
     int b_elems = k * n;
     int c_elems = m * n;
 
-    int max_rows_by_c = MAX_MATRIX_ELEMS / n;
-    int max_k_per_tile = MAX_MATRIX_ELEMS / n;
-    if (max_rows_by_c < 1 || max_k_per_tile < 1) {
-        return;
-    }
-    if (max_k_per_tile > k) {
-        max_k_per_tile = k;
-    }
-
     for (uint32_t batch_offset = 0; batch_offset < count; batch_offset++) {
         int batch = (int)(start + batch_offset);
 
-        const float *A_batch = A + batch * a_elems;
-        const float *B_batch = B + batch * b_elems;
+        const half *A_batch = A + batch * a_elems;
+        const half *B_batch = B + batch * b_elems;
         float *C_batch = C + batch * c_elems;
 
-        for (int k_base = 0; k_base < k; k_base += max_k_per_tile) {
-            int tile_k = k - k_base;
-            if (tile_k > max_k_per_tile) {
-                tile_k = max_k_per_tile;
+        for (int row_base = 0; row_base < m; row_base += TILE_M) {
+            int tile_m = m - row_base;
+            if (tile_m > TILE_M) {
+                tile_m = TILE_M;
             }
 
-            int wram_idx = 0;
-            int out_channel_blocks = n / 64;
-            if (out_channel_blocks > 0) {
-                for (int group = 0; group < 64; group += 4) {
-                    for (int block = 0; block < out_channel_blocks; block++) {
-                        for (int lane = 0; lane < 4; lane++) {
-                            int col = block * 64 + group + lane;
-                            for (int kk = 0; kk < tile_k; kk++) {
-                                wram_B[wram_idx++] =
-                                    B_batch[(k_base + kk) * n + col];
-                            }
+            for (int col_base = 0; col_base < n; col_base += TILE_N) {
+                int tile_n = n - col_base;
+                if (tile_n > TILE_N) {
+                    tile_n = TILE_N;
+                }
+
+                for (int k_base = 0; k_base < k; k_base += TILE_K) {
+                    int tile_k = k - k_base;
+                    if (tile_k > TILE_K) {
+                        tile_k = TILE_K;
+                    }
+
+                    for (int row = 0; row < tile_m; row++) {
+                        __memcpy(nram_A + row * tile_k,
+                                 A_batch + (row_base + row) * k + k_base,
+                                 tile_k * sizeof(half),
+                                 GDRAM2NRAM);
+                    }
+
+                    for (int col = 0; col < tile_n; col++) {
+                        for (int kk = 0; kk < tile_k; kk++) {
+                            wram_B_col[col * tile_k + kk] =
+                                B_batch[(k_base + kk) * n + col_base + col];
                         }
                     }
-                }
-                for (int col = out_channel_blocks * 64; col < n; col++) {
-                    for (int kk = 0; kk < tile_k; kk++) {
-                        wram_B[wram_idx++] =
-                            B_batch[(k_base + kk) * n + col];
-                    }
-                }
-            } else {
-                for (int col = 0; col < n; col++) {
-                    for (int kk = 0; kk < tile_k; kk++) {
-                        wram_B[wram_idx++] =
-                            B_batch[(k_base + kk) * n + col];
-                    }
-                }
-            }
 
-            int max_rows_by_a = MAX_MATRIX_ELEMS / tile_k;
-            int rows_per_tile = max_rows_by_a < max_rows_by_c
-                                    ? max_rows_by_a
-                                    : max_rows_by_c;
-            if (rows_per_tile < 1) {
-                return;
-            }
-            if (rows_per_tile > m) {
-                rows_per_tile = m;
-            }
+                    __bang_matmul(nram_C,
+                                  nram_A,
+                                  wram_B_col,
+                                  tile_m,
+                                  tile_k,
+                                  tile_n,
+                                  FIX_POSITION);
 
-            for (int row_base = 0; row_base < m; row_base += rows_per_tile) {
-                int tile_m = m - row_base;
-                if (tile_m > rows_per_tile) {
-                    tile_m = rows_per_tile;
-                }
-
-                for (int row = 0; row < tile_m; row++) {
-                    __memcpy(nram_A + row * tile_k,
-                             A_batch + (row_base + row) * k + k_base,
-                             tile_k * sizeof(float),
-                             GDRAM2NRAM);
-                }
-
-                __bang_conv(nram_out_trans,
-                            nram_A,
-                            wram_B,
-                            tile_k,
-                            tile_m,
-                            1,
-                            1,
-                            1,
-                            1,
-                            1,
-                            n);
-
-                for (int row = 0; row < tile_m; row++) {
-                    for (int col = 0; col < n; col++) {
-                        int out_idx = (row_base + row) * n + col;
-                        float partial = nram_out_trans[col * tile_m + row];
-                        if (k_base == 0) {
-                            C_batch[out_idx] = partial;
-                        } else {
-                            C_batch[out_idx] += partial;
+                    for (int row = 0; row < tile_m; row++) {
+                        for (int col = 0; col < tile_n; col++) {
+                            int out_idx = (row_base + row) * n + col_base + col;
+                            float partial = nram_C[row * tile_n + col];
+                            if (k_base == 0) {
+                                C_batch[out_idx] = partial;
+                            } else {
+                                C_batch[out_idx] += partial;
+                            }
                         }
                     }
                 }
@@ -155,6 +117,8 @@ torch::Tensor bang_func(
 {
     TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
+    TORCH_CHECK(A.scalar_type() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(B.scalar_type() == torch::kFloat16, "B must be float16");
     TORCH_CHECK(A.dim() == 3, "A must be 3D: [batch_size, m, k]");
     TORCH_CHECK(B.dim() == 3, "B must be 3D: [batch_size, k, n]");
 
@@ -173,19 +137,9 @@ torch::Tensor bang_func(
     TORCH_CHECK(m > 0, "m must be greater than 0");
     TORCH_CHECK(k > 0, "k must be greater than 0");
     TORCH_CHECK(n > 0, "n must be greater than 0");
-    TORCH_CHECK(n <= MAX_MATRIX_ELEMS,
-                "n is too large for this kernel");
 
-    torch::Tensor A_fp32 = A;
-    torch::Tensor B_fp32 = B;
-    if (A.scalar_type() != torch::kFloat) {
-        A_fp32 = A.to(torch::kFloat);
-    }
-    if (B.scalar_type() != torch::kFloat) {
-        B_fp32 = B.to(torch::kFloat);
-    }
-
-    auto C_fp32 = torch::empty({batch_size, m, n}, A_fp32.options());
+    auto C_fp32 = torch::empty({batch_size, m, n},
+                               A.options().dtype(torch::kFloat));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
@@ -193,10 +147,10 @@ torch::Tensor bang_func(
     cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    batched_matmul_conv_kernel<<<dim, ktype, queue>>>(
+    batched_matmul_half_kernel<<<dim, ktype, queue>>>(
         C_fp32.data_ptr<float>(),
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
+        reinterpret_cast<const half *>(A.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(B.data_ptr<at::Half>()),
         batch_size,
         m,
         k,
