@@ -295,7 +295,7 @@ def test_operator(name, meta, device="mlu"):
         print(f"  精度: 参考输出为空，跳过对比")
 
     # 确定性验证 (Scatter_add 专用)
-    if name == "Scatter_add" and ok:
+    if name == "Scatter_add":
         print("  确定性验证: src=ones(1024,256) index=zeros(1024) ...")
         N, D, ds = 1024, 256, 512
         val_src = torch.ones(N, D, device=device)
@@ -309,9 +309,13 @@ def test_operator(name, meta, device="mlu"):
         val_status = "PASS" if val_ok else "FAIL"
         print(f"  确定性: max_diff={val_diff:.6f}  [{val_status}]")
         if not val_ok:
-            print(f"    输出行0前5个值: {val_out[0, :5].tolist()}")
-            print(f"    期望: {expected[0, :5].tolist()}")
+            print(f"    输出行0前10个值: {val_out[0, :10].tolist()}")
+            print(f"    期望: {expected[0, :10].tolist()}")
+            val_sum = val_out.sum().item()
+            print(f"    输出总和={val_sum:.2f} (期望={float(N * D):.2f})")
             ok = False
+        elif not ok:
+            print(f"    确定性测试通过，但随机数据精度超标——问题出在index取模/边界处理")
 
     # 性能对比
     if torch_time_ms > 0:
