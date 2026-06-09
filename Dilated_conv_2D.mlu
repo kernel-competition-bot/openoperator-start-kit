@@ -59,8 +59,18 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int out_oc_stride     = H_out * W_out;
 
     // ---- NRAM 缓冲区 ----
-    __nram__ float nram_in[16384];     // 输入 tile
-    __nram__ float nram_out[16384];     // 输出累加器
+    // 按 H 维度分 tile，保证输入/输出 tile 适配 NRAM 容量
+    // nram_in/out 各 16384 floats (64KB)，总计 128KB，安全在 512KB NRAM 内
+    int tile_h = H;
+    while ((tile_h * W > 16384 || tile_h * W_out > 16384) && tile_h > 1) {
+        tile_h /= 2;
+    }
+
+    // NRAM 变量声明于函数顶层，各 tile 复用
+    __nram__ float nram_in[16384];     // 输入通道 tile
+    __nram__ float nram_out[16384];     // 输出 tile 累加器
+    __nram__ float nram_row_acc[128];   // 行累加器
+    __nram__ float nram_row_tmp[128];   // 中间结果
 
     // ========================================================================
     // 每个 core 处理分配给它的 (n, oc) 对
@@ -73,49 +83,51 @@ __mlu_entry__ void dilated_conv2d_kernel(
         // 当前 (n, oc) 的 GDRAM 输出基址
         float* out_gdram = output + n * out_batch_stride + oc * out_oc_stride;
 
-        // ---- 按 H 方向分块 ----
-        int tile_h = 64;
+        // 按 tile_h 分块处理 H 维度
         for (int oh_tile_start = 0; oh_tile_start < H_out; oh_tile_start += tile_h) {
             int oh_tile_end = oh_tile_start + tile_h;
             if (oh_tile_end > H_out) oh_tile_end = H_out;
             int cur_tile_h = oh_tile_end - oh_tile_start;
-
-            // ---- 计算需要的输入行范围 ----
-            int load_ih_start = oh_tile_start * stride_h - padding_h;
-            if (load_ih_start < 0) load_ih_start = 0;
-            int load_ih_end = (oh_tile_end - 1) * stride_h + (kH - 1) * dilation_h - padding_h + 1;
-            if (load_ih_end > H) load_ih_end = H;
-            int num_in_rows = load_ih_end - load_ih_start;
-            if (num_in_rows <= 0) continue;
+            int out_tile_size = cur_tile_h * W_out;
 
             // 清零输出 tile 累加器
-            int out_tile_size = cur_tile_h * W_out;
             __bang_write_zero(nram_out, out_tile_size);
 
-            // ---- 遍历输入通道 ic ----
+            // ---- 遍历所有输入通道 ic ----
             for (int ic = 0; ic < C_in; ic++) {
-                // 加载该 ic 的输入行到 NRAM
-                __memcpy(
-                    nram_in,
-                    input + n * in_batch_stride + ic * in_channel_stride + load_ih_start * W,
-                    num_in_rows * W * sizeof(float),
-                    GDRAM2NRAM);
+                // 该输入通道的 GDRAM 基址
+                const float* in_ch_base = input + n * in_batch_stride + ic * in_channel_stride;
 
-                // ---- 逐输出行计算贡献 ----
+                // 加载该 ic 下需要的输入行到 NRAM
+                int load_ih_start = oh_tile_start * stride_h - padding_h;
+                if (load_ih_start < 0) load_ih_start = 0;
+                int load_ih_end = (oh_tile_end - 1) * stride_h + (kH - 1) * dilation_h - padding_h + 1;
+                if (load_ih_end > H) load_ih_end = H;
+
+                for (int ih = load_ih_start; ih < load_ih_end; ih++) {
+                    int nram_row = ih - load_ih_start;
+                    __memcpy(nram_in + nram_row * W, in_ch_base + ih * W, W * sizeof(float), GDRAM2NRAM);
+                }
+
+                // 该 oc, ic 对应的权重基址
+                const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
+
+                // ---- 逐输出行处理 ----
                 for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
-                    int out_row_idx = oh - oh_tile_start;
-                    float* nram_out_row = nram_out + out_row_idx * W_out;
+                    int nram_out_row = oh - oh_tile_start;
 
-                    // ---- 逐 kernel 元素 ----
+                    // 清零行累加器
+                    __bang_write_zero(nram_row_acc, W_out);
+
+                    // 遍历 (kh, kw)
                     for (int kh = 0; kh < kH; kh++) {
                         int ih = oh * stride_h + kh * dilation_h - padding_h;
                         if (ih < 0 || ih >= H) continue;
 
-                        int nram_in_row_idx = ih - load_ih_start;
-                        float* nram_in_row = nram_in + nram_in_row_idx * W;
+                        int nram_in_row = ih - load_ih_start;
 
                         for (int kw = 0; kw < kW; kw++) {
-                            float w_val = weight[oc * w_oc_stride + ic * w_ic_stride + kh * kW + kw];
+                            float w_val = w_base[kh * kW + kw];
                             if (w_val == 0.0f) continue;
 
                             int iw_offset = kw * dilation_w - padding_w;
@@ -128,21 +140,29 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
                             int iw_start = ow_start + iw_offset;
 
-                            // ---- 逐元素计算 (纯标量，彻底避免对齐问题) ----
-                            for (int ow = ow_start, iw = iw_start; ow < ow_end; ow++, iw++) {
-                                nram_out_row[ow] += w_val * nram_in_row[iw];
+                            // ---- 按 64 分块，确保安全 ----
+                            int cur_ow = ow_start;
+                            int cur_iw = iw_start;
+                            while (cur_ow < ow_end) {
+                                int chunk = ow_end - cur_ow;
+                                if (chunk > 64) chunk = 64;
+
+                                __bang_mul_scalar(nram_row_tmp, nram_in + nram_in_row * W + cur_iw, w_val, chunk);
+                                __bang_add(nram_row_acc + cur_ow, nram_row_acc + cur_ow, nram_row_tmp, chunk);
+
+                                cur_ow += chunk;
+                                cur_iw += chunk;
                             }
                         }
                     }
+
+                    // 累加到 nram_out
+                    __bang_add(nram_out + nram_out_row * W_out, nram_out + nram_out_row * W_out, nram_row_acc, W_out);
                 }
             }
 
             // ---- 写回 GDRAM ----
-            __memcpy(
-                out_gdram + oh_tile_start * W_out,
-                nram_out,
-                out_tile_size * sizeof(float),
-                NRAM2GDRAM);
+            __memcpy(out_gdram + oh_tile_start * W_out, nram_out, out_tile_size * sizeof(float), NRAM2GDRAM);
         }
     }
 }
