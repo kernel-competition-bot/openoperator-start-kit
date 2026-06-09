@@ -49,7 +49,8 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
     __nram__ float nram_in[16384];       // 输入通道 tile
     __nram__ float nram_out[16384];      // 输出 tile 累加器
-    __nram__ float nram_tmp[4096];       // 临时缓冲
+    __nram__ float nram_tmp[4096];       // 临时缓冲 (与原始代码相同)
+
     // ========================================================================
     // 每个 core 处理分配给它的 (n, oc) 对
     // ========================================================================
@@ -76,19 +77,17 @@ __mlu_entry__ void dilated_conv2d_kernel(
                 // 该输入通道的 GDRAM 基址
                 const float* in_ch_base = input + n * in_batch_stride + ic * in_channel_stride;
 
-                // 加载该 ic 下需要的输入行到 NRAM (一次 DMA，行在内存中连续)
+                // 加载该 ic 下需要的输入行到 NRAM (逐行 DMA, 原始方式)
                 int load_ih_start = oh_tile_start * stride_h - padding_h;
                 if (load_ih_start < 0) load_ih_start = 0;
                 int load_ih_end = (oh_tile_end - 1) * stride_h + (kH - 1) * dilation_h - padding_h + 1;
                 if (load_ih_end > H) load_ih_end = H;
                 int num_in_rows = load_ih_end - load_ih_start;
 
-                // 一次性加载所有有效行
-                __memcpy(
-                    nram_in,
-                    in_ch_base + load_ih_start * W,
-                    num_in_rows * W * sizeof(float),
-                    GDRAM2NRAM);
+                for (int ih = load_ih_start; ih < load_ih_end; ih++) {
+                    int nram_row = ih - load_ih_start;
+                    __memcpy(nram_in + nram_row * W, in_ch_base + ih * W, W * sizeof(float), GDRAM2NRAM);
+                }
 
                 // 该 oc, ic 对应的权重基址
                 const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
@@ -124,24 +123,18 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
                             int iw_start = ow_start + iw_offset;
 
-                            // 向量乘加: 大块用向量, 小块用标量 (避免跨行越界)
-                            int cur_ow = ow_start;
-                            int cur_iw = iw_start;
-                            int rem = valid_w;
-                            // 向量处理完整的 64 元素块
-                            while (rem >= 64) {
-                                __bang_mul_scalar(nram_row_tmp_c,
-                                    nram_in + nram_in_row * W + cur_iw, w_val, 64);
-                                __bang_add(nram_row_acc + cur_ow,
-                                    nram_row_acc + cur_ow, nram_row_tmp_c, 64);
-                                rem -= 64;
-                                cur_ow += 64;
-                                cur_iw += 64;
-                            }
-                            // 标量处理剩余 (< 64) 元素, 避免向量读跨行
-                            for (int i = 0; i < rem; i++) {
-                                nram_row_acc[cur_ow + i] +=
-                                    w_val * nram_in[nram_in_row * W + cur_iw + i];
+                            // -----------------------------------------------
+                            // 核心修复: 仅在会跨行时用标量, 其余用向量
+                            // -----------------------------------------------
+                            if (iw_start + valid_w <= W) {
+                                // 行内完整, 向量操作
+                                __bang_mul_scalar(nram_row_tmp_c, nram_in + nram_in_row * W + iw_start, w_val, valid_w);
+                                __bang_add(nram_row_acc + ow_start, nram_row_acc + ow_start, nram_row_tmp_c, valid_w);
+                            } else {
+                                // 可能跨行, 标量操作
+                                for (int i = 0; i < valid_w; i++) {
+                                    nram_row_acc[ow_start + i] += w_val * nram_in[nram_in_row * W + iw_start + i];
+                                }
                             }
                         }
                     }
@@ -171,7 +164,8 @@ __mlu_entry__ void dilated_conv2d_kernel(
  *   - bias = False (无偏置)
  *   - dilation / padding 为方形参数
  *   - 空洞卷积输出尺寸公式:
- *     H_out = (H + 2*pad - dil*(K-1) - 1) / 1 + 1
+ *     H_out = (H + 2*pad - dil*(K-1) - 1) / stride + 1
+ *     W_out = (W + 2*pad - dil*(K-1) - 1) / stride + 1
  *
  * 参数:
  *   x:           输入张量，形状 [batch, in_channels, H, W]
