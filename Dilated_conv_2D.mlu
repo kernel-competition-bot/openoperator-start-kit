@@ -59,15 +59,14 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int out_oc_stride     = H_out * W_out;
 
     // ---- NRAM 缓冲区 ----
-    // 按 H 维度分 tile，保证输入/输出 tile 适配 NRAM 容量
-    // nram_in/out 各 16384 floats (64KB)，总计 128KB，安全在 512KB NRAM 内
-    int tile_h = H;
-    while ((tile_h * W > 16384 || tile_h * W_out > 16384) && tile_h > 1) {
-        tile_h /= 2;
-    }
+    // 关键修复: 限制 tile_h = 64，并将每行宽度扩展到 192
+    // nram_in: 64 行 × 192 列 = 12288 floats
+    // 每行的 [W, 192) 为安全区域，避免 kw=2 时向量操作越界
+    const int Walign = 192;
+    int tile_h = 64;
 
     // NRAM 变量声明于函数顶层，各 tile 复用
-    __nram__ float nram_in[16384];     // 输入通道 tile
+    __nram__ float nram_in[12288];     // 输入通道 tile (每行扩展到 192 floats)
     __nram__ float nram_out[16384];     // 输出 tile 累加器
     __nram__ float nram_row_acc[128];   // 行累加器
     __nram__ float nram_row_tmp[128];   // 中间结果
@@ -98,15 +97,19 @@ __mlu_entry__ void dilated_conv2d_kernel(
                 // 该输入通道的 GDRAM 基址
                 const float* in_ch_base = input + n * in_batch_stride + ic * in_channel_stride;
 
-                // 加载该 ic 下需要的输入行到 NRAM
+                // 加载该 ic 下需要的输入行到 NRAM (每行 128 floats)
                 int load_ih_start = oh_tile_start * stride_h - padding_h;
                 if (load_ih_start < 0) load_ih_start = 0;
                 int load_ih_end = (oh_tile_end - 1) * stride_h + (kH - 1) * dilation_h - padding_h + 1;
                 if (load_ih_end > H) load_ih_end = H;
+                int num_in_rows = load_ih_end - load_ih_start;
 
                 for (int ih = load_ih_start; ih < load_ih_end; ih++) {
                     int nram_row = ih - load_ih_start;
-                    __memcpy(nram_in + nram_row * W, in_ch_base + ih * W, W * sizeof(float), GDRAM2NRAM);
+                    // 先清零整行 (W 个有效 + 后面 64 个安全空间)
+                    __bang_write_zero(nram_in + nram_row * Walign, Walign);
+                    // 拷贝 W 个输入元素到行首
+                    __memcpy(nram_in + nram_row * Walign, in_ch_base + ih * W, W * sizeof(float), GDRAM2NRAM);
                 }
 
                 // 该 oc, ic 对应的权重基址
@@ -140,14 +143,8 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
                             int iw_start = ow_start + iw_offset;
 
-                            // ---- 100% 安全的向量化方案 ----
-                            // 先清空整个临时缓冲，确保硬件多访问的位置都是 0
-                            __bang_write_zero(nram_row_tmp, 128);
-
-                            // 向量乘法（硬件可能访问到对齐边界，但后面的都是 0 * w_val = 0）
-                            __bang_mul_scalar(nram_row_tmp, nram_in + nram_in_row * W + iw_start, w_val, valid_w);
-
-                            // 向量加法（只加 valid_w 个，后面的 0 不会影响结果）
+                            // 安全的向量化方案：每行有 192 floats，W=128，偏移 2 后读 128 个仍在本行内
+                            __bang_mul_scalar(nram_row_tmp, nram_in + nram_in_row * Walign + iw_start, w_val, valid_w);
                             __bang_add(nram_row_acc + ow_start, nram_row_acc + ow_start, nram_row_tmp, valid_w);
                         }
                     }
