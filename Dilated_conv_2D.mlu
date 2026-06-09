@@ -42,14 +42,13 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int out_oc_stride     = H_out * W_out;
 
     // ---- NRAM 缓冲区 ----
-    int tile_h = H;
-    while ((tile_h * W > 16384 || tile_h * W_out > 16384) && tile_h > 1) {
-        tile_h /= 2;
-    }
+    // tile_h=64: 限制 tile 高度为 64 行
+    // 在最后额外加一行全零"守卫行"——kw=2 时向量读越界会命中它
+    int tile_h = 64;
 
-    __nram__ float nram_in[16384];       // 输入通道 tile
-    __nram__ float nram_out[16384];      // 输出 tile 累加器
-    __nram__ float nram_tmp[4096];       // 临时缓冲 (与原始代码相同)
+    __nram__ float nram_in[16384];       // 输入 tile (最多 ~69 行 × 128)
+    __nram__ float nram_out[16384];      // 输出 tile (64 行 × 128, 两 tile 复用)
+    __nram__ float nram_tmp[4096];       // 临时缓冲
     // ========================================================================
     // 每个 core 处理分配给它的 (n, oc) 对
     // ========================================================================
@@ -83,12 +82,14 @@ __mlu_entry__ void dilated_conv2d_kernel(
                 if (load_ih_end > H) load_ih_end = H;
                 int num_in_rows = load_ih_end - load_ih_start;
 
-                // 一次性加载所有有效行
-                __memcpy(
-                    nram_in,
-                    in_ch_base + load_ih_start * W,
-                    num_in_rows * W * sizeof(float),
-                    GDRAM2NRAM);
+                // 一次性加载所有有效行 + 守卫行清零
+                if (num_in_rows > 0) {
+                    __memcpy(nram_in, in_ch_base + load_ih_start * W,
+                             num_in_rows * W * sizeof(float), GDRAM2NRAM);
+                }
+                // 守卫行: 紧接着最后一个有效行放入 128 个零
+                // kw=2 向量读跨行时命中此全零行, 确保不会读到下一行数据
+                __bang_write_zero(nram_in + num_in_rows * W, W);
 
                 // 该 oc, ic 对应的权重基址
                 const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
