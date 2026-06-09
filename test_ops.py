@@ -54,14 +54,14 @@ OPS_META = {
         "extra": {},
     },
     "MSE_Loss": {
-        "file": "MSE_Loss.mlu",
+        "file": "103_MSE_Loss.mlu",
         "args": ["predictions", "targets"],
         "ref": lambda pred, targ: torch.nn.functional.mse_loss(pred, targ),
         "shape": (1024, 256),
         "extra": {},
     },
     "Scatter_add": {
-        "file": "Scatter_add.mlu",
+        "file": "105_Scatter_add.mlu",
         "args": ["src", "index", "dim_size"],
         "ref": lambda src, idx, ds: torch.zeros(ds, src.size(1))
         .index_add_(0, idx.to(torch.int32) % ds, src),
@@ -69,7 +69,7 @@ OPS_META = {
         "extra": {"dim_size": 512},
     },
     "PointwiseConv2d": {
-        "file": "PointwiseConv2d.mlu",
+        "file": "104_PointwiseConv2d.mlu",
         "args": ["x", "weight", "bias"],
         "ref": lambda x, w, b=None: torch.nn.functional.conv2d(x, w, b),
         "shape": [(2, 64, 32, 32), (128, 64, 1, 1)],
@@ -83,6 +83,7 @@ NUM_TO_NAME = {
     "070": "Sqrt",
     "103": "MSE_Loss",
     "104": "PointwiseConv2d",
+    "105": "Scatter_add",
 }
 
 
