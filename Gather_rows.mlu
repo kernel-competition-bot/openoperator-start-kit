@@ -1,81 +1,40 @@
-// 110_Gather_rows v110_52_probe_spin_sweep_no_internal_sync
-#warning "BUILD_VERSION v110_52_probe_spin_sweep_no_internal_sync"
+// 110_Gather_rows v110_60_probe_cnrt_memcpy_small
+#warning "BUILD_VERSION v110_60_probe_cnrt_memcpy_small"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include "framework/core/MLUStream.h"
+#include <cstring>
 
 #define BATCH 64
 #define K_COL 32
+#define BYTES 4096
 
-// 只改这个值扫：
-// 0, 500, 1000, 2000, 4000, 8000, 16000, 32000
-#define SPIN 4000
-
-__mlu_entry__ void spin_half_kernel(
-    const half *input,
-    half *output,
-    int spin
-) {
-    if (taskId != 0) return;
-
-    volatile unsigned int acc = 1u;
-
-    for (int i = 0; i < spin; ++i) {
-        acc = acc * 1664525u + (unsigned int)i + 1013904223u;
-        acc ^= (acc >> 13);
-    }
-
-    ((volatile unsigned int*)output)[0] = acc;
-}
-
-__mlu_entry__ void spin_float_kernel(
-    const float *input,
-    float *output,
-    int spin
-) {
-    if (taskId != 0) return;
-
-    volatile unsigned int acc = 1u;
-
-    for (int i = 0; i < spin; ++i) {
-        acc = acc * 1664525u + (unsigned int)i + 1013904223u;
-        acc ^= (acc >> 13);
-    }
-
-    ((volatile unsigned int*)output)[0] = acc;
-}
+static unsigned char host_buf[BYTES];
 
 torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    // 拷一点 input 到 host
+    cnrtMemcpy(
+        host_buf,
+        input.data_ptr(),
+        BYTES,
+        CNRT_MEM_TRANS_DIR_DEV2HOST
+    );
 
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    // 再拷回 output
+    cnrtMemcpy(
+        output.data_ptr(),
+        host_buf,
+        BYTES,
+        CNRT_MEM_TRANS_DIR_HOST2DEV
+    );
 
-    if (input.scalar_type() == torch::kHalf) {
-        spin_half_kernel<<<dim, ktype, queue>>>(
-            (const half*)input.data_ptr<at::Half>(),
-            (half*)output.data_ptr<at::Half>(),
-            SPIN
-        );
-    } else if (input.scalar_type() == torch::kFloat32) {
-        spin_float_kernel<<<dim, ktype, queue>>>(
-            input.data_ptr<float>(),
-            output.data_ptr<float>(),
-            SPIN
-        );
-    } else {
-        TORCH_CHECK(false, "v110_52 supports only float16/float32 input");
-    }
-
-    fprintf(stderr,
-            "[SPIN_NOSYNC] SPIN=%d dtype=%d\n",
-            SPIN,
+    fprintf(stderr, "[CNRT_MEMCPY_SMALL] bytes=%d dtype=%d\n",
+            BYTES,
             (int)input.scalar_type());
     fflush(stderr);
 
