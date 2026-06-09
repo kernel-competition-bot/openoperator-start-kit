@@ -13,11 +13,11 @@
  * C: [batch_size, m, n]
  *
  * 按输出行和列 tile 并行，每个 task 计算一段 C[batch,row,col:col+TILE_N]。
- * NRAM 中用 float accumulator 沿 k 维向量化累加，最终写回 float16。
+ * NRAM 中用 float accumulator 沿 k 维向量化累加，最终写回 float32。
  * ============================================================================
  */
 __mlu_entry__ void batched_matmul_row_tile_kernel(
-    half *C,
+    float *C,
     const half *A,
     const half *B,
     int batch_size,
@@ -29,7 +29,6 @@ __mlu_entry__ void batched_matmul_row_tile_kernel(
     uint32_t task_num = taskDim;
 
     __nram__ half nram_b_half[TILE_N];
-    __nram__ half nram_out_half[TILE_N];
     __nram__ float nram_b_float[TILE_N];
     __nram__ float nram_tmp[TILE_N];
     __nram__ float nram_acc[TILE_N];
@@ -49,7 +48,7 @@ __mlu_entry__ void batched_matmul_row_tile_kernel(
 
         const half *A_batch = A + batch * a_elems;
         const half *B_batch = B + batch * b_elems;
-        half *C_batch = C + batch * c_elems;
+        float *C_batch = C + batch * c_elems;
 
         int col_base = col_tile * TILE_N;
         int tile_n = n - col_base;
@@ -75,10 +74,9 @@ __mlu_entry__ void batched_matmul_row_tile_kernel(
             __bang_add(nram_acc, nram_acc, nram_tmp, aligned_n);
         }
 
-        __bang_float2half(nram_out_half, nram_acc, aligned_n);
         __memcpy(C_batch + row * n + col_base,
-                 nram_out_half,
-                 tile_n * sizeof(half),
+                 nram_acc,
+                 tile_n * sizeof(float),
                  NRAM2GDRAM);
     }
 }
@@ -111,7 +109,8 @@ torch::Tensor bang_func(
     TORCH_CHECK(k > 0, "k must be greater than 0");
     TORCH_CHECK(n > 0, "n must be greater than 0");
 
-    auto C = torch::empty({batch_size, m, n}, A.options());
+    auto C = torch::empty({batch_size, m, n},
+                          A.options().dtype(torch::kFloat));
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
@@ -122,7 +121,7 @@ torch::Tensor bang_func(
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     batched_matmul_row_tile_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half *>(C.data_ptr<at::Half>()),
+        C.data_ptr<float>(),
         reinterpret_cast<const half *>(A.data_ptr<at::Half>()),
         reinterpret_cast<const half *>(B.data_ptr<at::Half>()),
         batch_size,
