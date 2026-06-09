@@ -65,7 +65,7 @@ OPS_META = {
         "args": ["src", "index", "dim_size"],
         "ref": lambda src, idx, ds: torch.zeros(ds, src.size(1))
         .index_add_(0, idx.to(torch.int32) % ds, src),
-        "shape": (1024, 256),
+        "shape": [(1024, 256), (1024,)],
         "extra": {"dim_size": 512},
     },
     "PointwiseConv2d": {

@@ -31,6 +31,7 @@ __mlu_entry__ void scatter_add_kernel(
 
     for (uint32_t i = 0; i < count; i++) {
         int idx = index[start + i];
+        idx = (idx % dim_size + dim_size) % dim_size;
         float *src_row = src + (start + i) * D;
         float *dst_row = local_out + idx * D;
 
