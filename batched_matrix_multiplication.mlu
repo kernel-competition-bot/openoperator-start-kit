@@ -2,55 +2,91 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#define MAX_MATRIX_ELEMS 65536
+#define FIX_POSITION 0
+
 /* ============================================================================
  * Batched Matrix Multiplication
  *
- * A: [batch_size, m, k]
- * B: [batch_size, k, n]
- * C: [batch_size, m, n]
+ * A: [batch_size, m, k]     float16
+ * B: [batch_size, k, n]     float16
+ * C: [batch_size, m, n]     float16
  *
- * 外部输出按题目要求返回 float16；kernel 内部使用 float32 指针和标量累加，
- * 避免 half 指针、half scalar cast 和 half intrinsic 在 inline 编译环境中的
- * 兼容问题。
+ * 使用 __bang_matmul 计算每个 batch 的矩阵乘法。__bang_matmul 要求右矩阵
+ * 为列主序，因此 kernel 中先把 B[k, n] 转成 B_col[n, k] 后拷到 WRAM。
  * ============================================================================
  */
 __mlu_entry__ void batched_matmul_kernel(
     float *C,
-    const float *A,
-    const float *B,
+    void *A_ptr,
+    void *B_ptr,
     int batch_size,
     int m,
     int k,
     int n)
 {
+    half *A = (half *)A_ptr;
+    half *B = (half *)B_ptr;
+
     uint32_t task_id = taskId;
     uint32_t task_num = taskDim;
 
-    int total = batch_size * m * n;
-    uint32_t per_task = (uint32_t)total / task_num;
-    uint32_t remainder = (uint32_t)total % task_num;
+    uint32_t per_task = (uint32_t)batch_size / task_num;
+    uint32_t remainder = (uint32_t)batch_size % task_num;
     uint32_t start = task_id * per_task +
                      (task_id < remainder ? task_id : remainder);
     uint32_t count = per_task +
                      (task_id < remainder ? 1 : 0);
 
-    for (uint32_t offset = 0; offset < count; offset++) {
-        int out_index = (int)(start + offset);
+    __nram__ half nram_A[MAX_MATRIX_ELEMS];
+    __nram__ half nram_B[MAX_MATRIX_ELEMS];
+    __nram__ half nram_B_col[MAX_MATRIX_ELEMS];
+    __nram__ float nram_C[MAX_MATRIX_ELEMS];
+    __wram__ half wram_B_col[MAX_MATRIX_ELEMS];
 
-        int batch = out_index / (m * n);
-        int inner = out_index - batch * m * n;
-        int row = inner / n;
-        int col = inner - row * n;
+    int a_elems = m * k;
+    int b_elems = k * n;
+    int c_elems = m * n;
 
-        int a_base = batch * m * k + row * k;
-        int b_base = batch * k * n + col;
+    for (uint32_t batch_offset = 0; batch_offset < count; batch_offset++) {
+        int batch = (int)(start + batch_offset);
 
-        float acc = 0.0f;
+        half *A_batch = A + batch * a_elems;
+        half *B_batch = B + batch * b_elems;
+        float *C_batch = C + batch * c_elems;
+
+        __memcpy(nram_A,
+                 A_batch,
+                 a_elems * sizeof(half),
+                 GDRAM2NRAM);
+        __memcpy(nram_B,
+                 B_batch,
+                 b_elems * sizeof(half),
+                 GDRAM2NRAM);
+
         for (int kk = 0; kk < k; kk++) {
-            acc += A[a_base + kk] * B[b_base + kk * n];
+            for (int col = 0; col < n; col++) {
+                nram_B_col[col * k + kk] = nram_B[kk * n + col];
+            }
         }
 
-        C[out_index] = acc;
+        __memcpy(wram_B_col,
+                 nram_B_col,
+                 b_elems * sizeof(half),
+                 NRAM2WRAM);
+
+        __bang_matmul(nram_C,
+                      nram_A,
+                      wram_B_col,
+                      m,
+                      k,
+                      n,
+                      FIX_POSITION);
+
+        __memcpy(C_batch,
+                 nram_C,
+                 c_elems * sizeof(float),
+                 NRAM2GDRAM);
     }
 }
 
@@ -79,16 +115,40 @@ torch::Tensor bang_func(
     TORCH_CHECK(m > 0, "m must be greater than 0");
     TORCH_CHECK(k > 0, "k must be greater than 0");
     TORCH_CHECK(n > 0, "n must be greater than 0");
+    TORCH_CHECK(m * k <= MAX_MATRIX_ELEMS,
+                "A matrix is too large for this kernel");
+    TORCH_CHECK(k * n <= MAX_MATRIX_ELEMS,
+                "B matrix is too large for this kernel");
+    TORCH_CHECK(m * n <= MAX_MATRIX_ELEMS,
+                "C matrix is too large for this kernel");
 
-    torch::Tensor A_fp32 = A;
-    torch::Tensor B_fp32 = B;
-    if (A.scalar_type() != torch::kFloat) {
-        A_fp32 = A.to(torch::kFloat);
+    torch::Tensor A_half = A;
+    torch::Tensor B_half = B;
+    if (A.scalar_type() != torch::kHalf) {
+        A_half = A.to(torch::kHalf);
     }
-    if (B.scalar_type() != torch::kFloat) {
-        B_fp32 = B.to(torch::kFloat);
+    if (B.scalar_type() != torch::kHalf) {
+        B_half = B.to(torch::kHalf);
     }
 
-    auto C_fp32 = torch::matmul(A_fp32, B_fp32);
+    auto C_fp32 = torch::empty(
+        {batch_size, m, n},
+        A_half.options().dtype(torch::kFloat));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    int task_num = (batch_size < 64) ? batch_size : 64;
+    cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    batched_matmul_kernel<<<dim, ktype, queue>>>(
+        C_fp32.data_ptr<float>(),
+        A_half.data_ptr(),
+        B_half.data_ptr(),
+        batch_size,
+        m,
+        k,
+        n);
+
     return C_fp32.to(torch::kHalf);
 }
