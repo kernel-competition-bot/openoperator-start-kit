@@ -116,11 +116,17 @@ __mlu_entry__ void kl_divergence_final_kernel(
 
 torch::Tensor bang_func(torch::Tensor input_log_prob,
                         torch::Tensor target_prob) {
-    TORCH_CHECK(input_log_prob.is_contiguous(), "input_log_prob must be contiguous");
-    TORCH_CHECK(target_prob.is_contiguous(), "target_prob must be contiguous");
+    // 提交评测端可能传入非 FP32；当前 BangC kernel 按 float* 读取，
+    // 所以在 wrapper 里统一转成 FP32 contiguous，再进入 kernel。
+    input_log_prob = input_log_prob.to(torch::kFloat32).contiguous();
+    target_prob = target_prob.to(torch::kFloat32).contiguous();
 
-    TORCH_CHECK(input_log_prob.dtype() == torch::kFloat32, "input_log_prob must be FP32");
-    TORCH_CHECK(target_prob.dtype() == torch::kFloat32, "target_prob must be FP32");
+
+    TORCH_CHECK(input_log_prob.is_contiguous(), "input_log_prob must be contiguous after FP32 cast");
+    TORCH_CHECK(target_prob.is_contiguous(), "target_prob must be contiguous after FP32 cast");
+
+    TORCH_CHECK(input_log_prob.dtype() == torch::kFloat32, "input_log_prob must be FP32 after cast");
+    TORCH_CHECK(target_prob.dtype() == torch::kFloat32, "target_prob must be FP32 after cast");
 
     TORCH_CHECK(input_log_prob.dim() == 2, "input_log_prob must be 2D");
     TORCH_CHECK(target_prob.dim() == 2, "target_prob must be 2D");
@@ -159,9 +165,4 @@ torch::Tensor bang_func(torch::Tensor input_log_prob,
     );
 
     return out;
-}
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_func", &bang_func, "KL_Divergence_Loss");
 }
