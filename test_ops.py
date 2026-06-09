@@ -117,6 +117,15 @@ def _extract_bang_func_params(mlu_path):
     for part in params_str.split(","):
         part = part.strip()
         if part:
+            depth = 0
+            for i, ch in enumerate(part):
+                if ch == '<':
+                    depth += 1
+                elif ch == '>':
+                    depth -= 1
+                elif ch == '=' and depth == 0:
+                    part = part[:i].strip()
+                    break
             params.append(part)
     return params
 
