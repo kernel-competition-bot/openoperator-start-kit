@@ -56,6 +56,7 @@ __mlu_entry__ void scatter_add_kernel(
 
             for (int p = chunk; p < CHUNK_SIZE; p++) {
                 nram_src[p] = 0.0f;
+                nram_dst[p] = 0.0f;
             }
 
             __bang_add(
