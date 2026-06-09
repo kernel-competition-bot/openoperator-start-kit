@@ -17,7 +17,7 @@
  * ============================================================================
  */
 __mlu_entry__ void batched_matmul_kernel(
-    float *C,
+    void *C_ptr,
     void *A_ptr,
     void *B_ptr,
     int batch_size,
@@ -25,6 +25,7 @@ __mlu_entry__ void batched_matmul_kernel(
     int k,
     int n)
 {
+    half *C = (half *)C_ptr;
     half *A = (half *)A_ptr;
     half *B = (half *)B_ptr;
 
@@ -41,7 +42,7 @@ __mlu_entry__ void batched_matmul_kernel(
     __nram__ half nram_A[MAX_MATRIX_ELEMS];
     __nram__ half nram_B[MAX_MATRIX_ELEMS];
     __nram__ half nram_B_col[MAX_MATRIX_ELEMS];
-    __nram__ float nram_C[MAX_MATRIX_ELEMS];
+    __nram__ half nram_C[MAX_MATRIX_ELEMS];
     __wram__ half wram_B_col[MAX_MATRIX_ELEMS];
 
     int a_elems = m * k;
@@ -53,7 +54,7 @@ __mlu_entry__ void batched_matmul_kernel(
 
         half *A_batch = A + batch * a_elems;
         half *B_batch = B + batch * b_elems;
-        float *C_batch = C + batch * c_elems;
+        half *C_batch = C + batch * c_elems;
 
         __memcpy(nram_A,
                  A_batch,
@@ -85,7 +86,7 @@ __mlu_entry__ void batched_matmul_kernel(
 
         __memcpy(C_batch,
                  nram_C,
-                 c_elems * sizeof(float),
+                 c_elems * sizeof(half),
                  NRAM2GDRAM);
     }
 }
@@ -131,9 +132,9 @@ torch::Tensor bang_func(
         B_half = B.to(torch::kHalf);
     }
 
-    auto C_fp32 = torch::empty(
+    auto C_half = torch::empty(
         {batch_size, m, n},
-        A_half.options().dtype(torch::kFloat));
+        A_half.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
@@ -142,7 +143,7 @@ torch::Tensor bang_func(
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     batched_matmul_kernel<<<dim, ktype, queue>>>(
-        C_fp32.data_ptr<float>(),
+        C_half.data_ptr(),
         A_half.data_ptr(),
         B_half.data_ptr(),
         batch_size,
@@ -150,5 +151,5 @@ torch::Tensor bang_func(
         k,
         n);
 
-    return C_fp32.to(torch::kHalf);
+    return C_half;
 }
