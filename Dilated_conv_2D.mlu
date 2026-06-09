@@ -2,23 +2,6 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-/* ============================================================================
- * Dilated Conv2D Kernel — 高性能 NRAM 向量化版本 v2
- *
- * 关键优化:
- *   1. 多 oc 并行:  输入 tile 被 OC_GROUP 个输出通道共享
- *   2. 合并 DMA:    每个输入通道 1 次大 __memcpy
- *   3. 直接累加:    去掉 row_acc 中间缓冲, 直接累加到 nram_out
- *   4. 预计算:      kw 参数/kh 偏移 在循环外预计算为数组
- *   5. kh-oh 反转:  按 kh 筛选有效 oh 范围, 消除逐 oh 的 ih 边界检查
- *   6. 权重预加载:  每个 (oc_group, ic) 的权重一次性加载到 NRAM
- *   7. 多核拆分:    按 batch 并行
- * ============================================================================
- */
-
-#define OC_GROUP  8
-#define H_TILE    64
-
 __mlu_entry__ void dilated_conv2d_kernel(
     const float* input,       // [N, C_in, H, W]
     const float* weight,      // [C_out, C_in, kH, kW]
@@ -59,10 +42,6 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int out_oc_stride     = H_out * W_out;
 
     // ---- NRAM 缓冲区 ----
-    // nram_in:  输入 tile (行连续存储, 一次 DMA 加载)
-    // nram_out: 输出累加器
-    // nram_row_acc: 行累加器 (扩展到 192, 防止 kw=0 时向量写越界)
-    // nram_row_tmp: 中间缓冲 (扩展到 192)
     int tile_h = H;
     while ((tile_h * W > 16384 || tile_h * W_out > 16384) && tile_h > 1) {
         tile_h /= 2;
@@ -70,9 +49,7 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
     __nram__ float nram_in[16384];       // 输入通道 tile
     __nram__ float nram_out[16384];      // 输出 tile 累加器
-    __nram__ float nram_row_acc[192];    // 行累加器 (192 > 128 防越界)
-    __nram__ float nram_row_tmp[192];    // 中间结果 (192 > 128 防越界)
-
+    __nram__ float nram_tmp[4096];       // 临时缓冲 (与原始代码相同)
     // ========================================================================
     // 每个 core 处理分配给它的 (n, oc) 对
     // ========================================================================
@@ -106,7 +83,7 @@ __mlu_entry__ void dilated_conv2d_kernel(
                 if (load_ih_end > H) load_ih_end = H;
                 int num_in_rows = load_ih_end - load_ih_start;
 
-                // 一次性加载所有行 (快！)
+                // 一次性加载所有有效行
                 __memcpy(
                     nram_in,
                     in_ch_base + load_ih_start * W,
@@ -115,6 +92,9 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
                 // 该 oc, ic 对应的权重基址
                 const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
+
+                float* nram_row_acc = nram_tmp;
+                float* nram_row_tmp_c = nram_tmp + 128;
 
                 // ---- 逐输出行处理 ----
                 for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
@@ -144,33 +124,9 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
                             int iw_start = ow_start + iw_offset;
 
-                            // ---- 安全的向量+标量混合方案 ----
-                            // kw=2 (iw_start=2): 向量操作会跨行读, 最后一段用标量
-                            // kw=0 (ow_start=2): 向量写可能越界, 但 nram_row_acc 已扩展到 192 安全
-                            if (iw_start > 0 && valid_w == 126) {
-                                // kw=2 特化: iw_start=2, 读 [2,129) 会越界到下一行
-                                // 方案: 前 64 元素向量化, 后 62 元素标量
-                                __bang_mul_scalar(nram_row_tmp, nram_in + nram_in_row * W + 2, w_val, 64);
-                                __bang_add(nram_row_acc, nram_row_acc, nram_row_tmp, 64);
-                                // 尾部标量 (62 elements, 安全)
-                                for (int i = 0; i < 62; i++) {
-                                    nram_row_acc[64 + i] += w_val * nram_in[nram_in_row * W + 66 + i];
-                                }
-                            } else {
-                                // kw=0, kw=1 通用路径: 分 64 块向量化
-                                // nram_row_acc 有 192 空间, 即使 ow_start=2 写 128 也安全
-                                int cur_ow = ow_start;
-                                int cur_iw = iw_start;
-                                int rem = valid_w;
-                                while (rem > 0) {
-                                    int chunk = (rem > 64) ? 64 : rem;
-                                    __bang_mul_scalar(nram_row_tmp, nram_in + nram_in_row * W + cur_iw, w_val, chunk);
-                                    __bang_add(nram_row_acc + cur_ow, nram_row_acc + cur_ow, nram_row_tmp, chunk);
-                                    rem -= chunk;
-                                    cur_ow += chunk;
-                                    cur_iw += chunk;
-                                }
-                            }
+                            // 向量乘加
+                            __bang_mul_scalar(nram_row_tmp_c, nram_in + nram_in_row * W + iw_start, w_val, valid_w);
+                            __bang_add(nram_row_acc + ow_start, nram_row_acc + ow_start, nram_row_tmp_c, valid_w);
                         }
                     }
 
