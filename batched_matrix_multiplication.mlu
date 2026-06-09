@@ -12,7 +12,8 @@
  * C: [batch_size, m, n]
  *
  * 使用教程 05_matmul 中的 __bang_conv 映射实现 float32 矩阵乘法。
- * Conv 输出布局为 [n, m, 1]，写回时转置为目标 [m, n]。
+ * A/B/C 按 m、n 维分块，避免大矩阵一次性搬入 NRAM/WRAM。
+ * Conv 输出布局为 [tile_n, tile_m, 1]，写回时转置为目标 [m, n]。
  * 返回前转换为 float16，满足题目数据格式要求。
  * ============================================================================
  */
@@ -43,6 +44,16 @@ __mlu_entry__ void batched_matmul_conv_kernel(
     int b_elems = k * n;
     int c_elems = m * n;
 
+    int max_cols_per_tile = MAX_MATRIX_ELEMS / k;
+    if (max_cols_per_tile < 1) {
+        return;
+    }
+    if (max_cols_per_tile > n) {
+        max_cols_per_tile = n;
+    }
+
+    int max_rows_by_a = MAX_MATRIX_ELEMS / k;
+
     for (uint32_t batch_offset = 0; batch_offset < count; batch_offset++) {
         int batch = (int)(start + batch_offset);
 
@@ -50,30 +61,59 @@ __mlu_entry__ void batched_matmul_conv_kernel(
         const float *B_batch = B + batch * b_elems;
         float *C_batch = C + batch * c_elems;
 
-        __memcpy(nram_A,
-                 A_batch,
-                 a_elems * sizeof(float),
-                 GDRAM2NRAM);
-        __memcpy(wram_B,
-                 B_batch,
-                 b_elems * sizeof(float),
-                 GDRAM2WRAM);
+        for (int col_base = 0; col_base < n; col_base += max_cols_per_tile) {
+            int tile_n = n - col_base;
+            if (tile_n > max_cols_per_tile) {
+                tile_n = max_cols_per_tile;
+            }
 
-        __bang_conv(nram_out_trans,
-                    nram_A,
-                    wram_B,
-                    k,
-                    m,
-                    1,
-                    1,
-                    1,
-                    1,
-                    1,
-                    n);
+            for (int kk = 0; kk < k; kk++) {
+                __memcpy(wram_B + kk * tile_n,
+                         B_batch + kk * n + col_base,
+                         tile_n * sizeof(float),
+                         GDRAM2WRAM);
+            }
 
-        for (int row = 0; row < m; row++) {
-            for (int col = 0; col < n; col++) {
-                C_batch[row * n + col] = nram_out_trans[col * m + row];
+            int max_rows_by_c = MAX_MATRIX_ELEMS / tile_n;
+            int rows_per_tile = max_rows_by_a < max_rows_by_c
+                                    ? max_rows_by_a
+                                    : max_rows_by_c;
+            if (rows_per_tile < 1) {
+                return;
+            }
+            if (rows_per_tile > m) {
+                rows_per_tile = m;
+            }
+
+            for (int row_base = 0; row_base < m; row_base += rows_per_tile) {
+                int tile_m = m - row_base;
+                if (tile_m > rows_per_tile) {
+                    tile_m = rows_per_tile;
+                }
+
+                __memcpy(nram_A,
+                         A_batch + row_base * k,
+                         tile_m * k * sizeof(float),
+                         GDRAM2NRAM);
+
+                __bang_conv(nram_out_trans,
+                            nram_A,
+                            wram_B,
+                            k,
+                            tile_m,
+                            1,
+                            1,
+                            1,
+                            1,
+                            1,
+                            tile_n);
+
+                for (int row = 0; row < tile_m; row++) {
+                    for (int col = 0; col < tile_n; col++) {
+                        C_batch[(row_base + row) * n + col_base + col] =
+                            nram_out_trans[col * tile_m + row];
+                    }
+                }
             }
         }
     }
@@ -104,12 +144,8 @@ torch::Tensor bang_func(
     TORCH_CHECK(m > 0, "m must be greater than 0");
     TORCH_CHECK(k > 0, "k must be greater than 0");
     TORCH_CHECK(n > 0, "n must be greater than 0");
-    TORCH_CHECK(m * k <= MAX_MATRIX_ELEMS,
-                "A matrix is too large for this kernel");
-    TORCH_CHECK(k * n <= MAX_MATRIX_ELEMS,
-                "B matrix is too large for this kernel");
-    TORCH_CHECK(m * n <= MAX_MATRIX_ELEMS,
-                "C matrix is too large for this kernel");
+    TORCH_CHECK(k <= MAX_MATRIX_ELEMS,
+                "k is too large for this kernel");
 
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
