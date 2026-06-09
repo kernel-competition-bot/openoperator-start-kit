@@ -60,6 +60,47 @@ __mlu_entry__ void unfold_kernel(
 }
 
 
+__mlu_entry__ void unfold_stride1_pad0_kernel(
+    const half *input,
+    half *output,
+    int N,
+    int C,
+    int H,
+    int W,
+    int K,
+    int H_out,
+    int W_out,
+    int total_rows)
+{
+    int task_id = (int)taskId;
+    int task_num = (int)taskDim;
+
+    int kernel_area = K * K;
+    int rows_per_batch = C * kernel_area;
+    int out_columns = H_out * W_out;
+    int items_per_batch = rows_per_batch * H_out;
+
+    for (int item = task_id; item < total_rows; item += task_num) {
+        int n = item / items_per_batch;
+        int inner = item - n * items_per_batch;
+        int row = inner / H_out;
+        int oh = inner - row * H_out;
+
+        int c = row / kernel_area;
+        int k_rem = row - c * kernel_area;
+        int kh = k_rem / K;
+        int kw = k_rem - kh * K;
+
+        const half *in_ptr = input + ((n * C + c) * H + (oh + kh)) * W + kw;
+        half *out_ptr = output + (n * rows_per_batch + row) * out_columns + oh * W_out;
+
+        for (int ow = 0; ow < W_out; ++ow) {
+            out_ptr[ow] = in_ptr[ow];
+        }
+    }
+}
+
+
 torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int padding)
 {
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
@@ -91,19 +132,34 @@ torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int paddin
     cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    unfold_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
-        N,
-        C,
-        H,
-        W,
-        K,
-        stride,
-        padding,
-        H_out,
-        W_out,
-        total);
+    if (padding == 0 && stride == 1) {
+        int total_rows = N * rows * H_out;
+        unfold_stride1_pad0_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            N,
+            C,
+            H,
+            W,
+            K,
+            H_out,
+            W_out,
+            total_rows);
+    } else {
+        unfold_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+            reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+            N,
+            C,
+            H,
+            W,
+            K,
+            stride,
+            padding,
+            H_out,
+            W_out,
+            total);
+    }
 
     return output;
 }
