@@ -164,7 +164,7 @@ __mlu_entry__ void scatter_add_reduce_kernel(
 torch::Tensor bang_func(
     torch::Tensor src,
     torch::Tensor index,
-    int64_t dim_size) {
+    int dim_size) {
 
     TORCH_CHECK(src.dim() == 2,
                 "src must be a 2D tensor, shape [N, D]");
@@ -202,7 +202,7 @@ torch::Tensor bang_func(
 
     int N = static_cast<int>(src_fp32.size(0));
     int D = static_cast<int>(src_fp32.size(1));
-    int ds = static_cast<int>(dim_size);
+    int ds = dim_size;
 
     TORCH_CHECK(D > 0,
                 "D must be positive");
