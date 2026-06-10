@@ -45,7 +45,7 @@ __mlu_entry__ void mse_partial_kernel(
     __nram__ float nram_targ[CHUNK_SIZE];
     __nram__ float nram_diff[CHUNK_SIZE];
 
-    float local_sum = 0.0f;
+    double local_sum = 0.0;
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
         uint32_t len =
@@ -78,11 +78,11 @@ __mlu_entry__ void mse_partial_kernel(
             len);
 
         for (uint32_t i = 0; i < len; i++) {
-            local_sum += nram_diff[i];
+            local_sum += (double)nram_diff[i];
         }
     }
 
-    partial_output[core_id] = local_sum;
+    partial_output[core_id] = (float)local_sum;
 }
 
 
@@ -96,13 +96,13 @@ __mlu_entry__ void mse_reduce_kernel(
         return;
     }
 
-    float global_sum = 0.0f;
+    double global_sum = 0.0;
 
     for (int i = 0; i < core_num_arg; i++) {
-        global_sum += partial_output[i];
+        global_sum += (double)partial_output[i];
     }
 
-    output[0] = global_sum / (float)total;
+    output[0] = (float)(global_sum / (double)total);
 }
 
 
@@ -156,7 +156,7 @@ torch::Tensor bang_func(
                              .dtype(torch::kFloat)
                              .device(pred_fp32.device());
 
-    auto partial_output = torch::empty(
+    auto partial_output = torch::zeros(
         {CORE_NUM},
         float_options);
 

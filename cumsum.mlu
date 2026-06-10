@@ -22,6 +22,7 @@ __mlu_entry__ void cumsum_half_dim1_scan_kernel(
     for (int row = tid; row < rows; row += task_num) {
         int base = row * cols;
 
+        // Load one row.
         __memcpy(
             buf,
             input + base,
@@ -29,7 +30,9 @@ __mlu_entry__ void cumsum_half_dim1_scan_kernel(
             GDRAM2NRAM
         );
 
-       
+        // Important:
+        // Clear the tail [cols, NRAM_COLS), because vector ops use aligned length.
+        // Without this, aligned vector ops may read/write uninitialized tail data.
         int tail = NRAM_COLS - cols;
         if (tail > 0) {
             __bang_write_zero(
@@ -42,7 +45,7 @@ __mlu_entry__ void cumsum_half_dim1_scan_kernel(
             );
         }
 
-      
+       
         for (int offset = 1; offset < cols; offset <<= 1) {
             int valid_len = cols - offset;
             int aligned_len = (valid_len + 63) & ~63;
@@ -55,7 +58,7 @@ __mlu_entry__ void cumsum_half_dim1_scan_kernel(
                 NRAM2NRAM
             );
 
-           
+          
             __bang_write_zero(
                 tmp,
                 offset
@@ -78,6 +81,7 @@ __mlu_entry__ void cumsum_half_dim1_scan_kernel(
                 }
             }
 
+            // buf[offset : offset + valid_len] += old buf[0 : valid_len]
             __bang_add(
                 buf + offset,
                 buf + offset,
