@@ -1,7 +1,10 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cfloat.h>   // for FLT_MAX
+#include <cfloat.h>   // FLT_MAX
+
+// 假定维度不超过 8，若需要更大维度可扩展此宏
+#define MAX_NDIM 8
 
 __mlu_entry__ void argmax_kernel(
     float *x,
@@ -10,8 +13,8 @@ __mlu_entry__ void argmax_kernel(
     int dim_size,
     int ndim,
     int dim,
-    int *shape_g,
-    int *stride_g) {
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7,
+    int st0, int st1, int st2, int st3, int st4, int st5, int st6, int st7) {
 
     uint32_t task_id = taskId;
     uint32_t task_num = taskDim;
@@ -23,20 +26,20 @@ __mlu_entry__ void argmax_kernel(
     uint32_t count = per_task +
                      (task_id < remainder ? 1 : 0);
 
-    // 将 shape 和 stride 加载到 NRAM
+    // 将标量参数组合成 NRAM 数组，供循环使用
     __nram__ int shape[8];
     __nram__ int stride[8];
-    __memcpy(shape, shape_g, ndim * sizeof(int), GDRAM2NRAM);
-    __memcpy(stride, stride_g, ndim * sizeof(int), GDRAM2NRAM);
+    shape[0] = s0; shape[1] = s1; shape[2] = s2; shape[3] = s3;
+    shape[4] = s4; shape[5] = s5; shape[6] = s6; shape[7] = s7;
+    stride[0] = st0; stride[1] = st1; stride[2] = st2; stride[3] = st3;
+    stride[4] = st4; stride[5] = st5; stride[6] = st6; stride[7] = st7;
 
-    // 每个任务处理一段输出元素
+    // 每个 task 处理一段输出元素
     for (uint32_t out_idx = start; out_idx < start + count; ++out_idx) {
-
-        // 将输出线性索引转换为输入（去掉 dim 维度）的基地址
         int remaining = out_idx;
         int base_offset = 0;
 
-        // 从最内层维度开始解析多维坐标（跳过 dim）
+        // 将线性输出索引反解为多维坐标（跳过 dim 维度）
         for (int j = ndim - 1; j >= 0; --j) {
             if (j == dim) continue;
             int size_j = shape[j];
@@ -49,7 +52,6 @@ __mlu_entry__ void argmax_kernel(
         float max_val = -FLT_MAX;
         int64_t max_idx = 0;
 
-        // 标量逐元素访问（因为 stride[dim] 不一定为 1，无法连续加载）
         for (int i = 0; i < dim_size; ++i) {
             float val = x[base_offset + i * stride[dim]];
             if (val > max_val) {
@@ -71,30 +73,35 @@ torch::Tensor argmax_mlu(
     int64_t ndim = x.dim();
     if (dim < 0) dim += ndim;
     TORCH_CHECK(dim >= 0 && dim < ndim, "dim out of range");
+    TORCH_CHECK(ndim <= MAX_NDIM, "Only support up to 8-dimensional tensors");
 
-    // 转换为 float 进行计算（保持原始类型用于输出判断，但输出是 long）
+    // 转换为 float 进行计算
     auto original_dtype = x.scalar_type();
     torch::Tensor x_fp32 = x;
     if (original_dtype != torch::kFloat) {
         x_fp32 = x.to(torch::kFloat);
     }
-
-    // 确保连续性（便于地址计算）
     x_fp32 = x_fp32.contiguous();
 
-    // 输出形状：移除 dim 维度
+    // 输出形状
     std::vector<int64_t> out_shape;
     for (int64_t i = 0; i < ndim; ++i) {
-        if (i != dim) out_shape.push_back(x.size(i));
+        if (i != dim) out_shape.push_back(x_fp32.size(i));
     }
-    auto indices = torch::empty(out_shape, torch::dtype(torch::kLong).device(x.device()));
+
+    // 避免直接使用 torch::empty，改用 x.new_empty 创建输出张量
+    auto indices = x_fp32.new_empty(out_shape, torch::dtype(torch::kLong));
 
     int total_out = indices.numel();
     int dim_size = x_fp32.size(dim);
 
-    // 将 shape 和 stride 放入 MLU 全局内存，以便 kernel 访问
-    auto shape_tensor = torch::tensor(x_fp32.sizes(), torch::kInt32).to(x.device());
-    auto stride_tensor = torch::tensor(x_fp32.strides(), torch::kInt32).to(x.device());
+    // 将 shape 和 stride 作为标量参数传入 kernel，不再需要设备侧 tensor
+    int s[MAX_NDIM] = {0};
+    int st[MAX_NDIM] = {0};
+    for (int i = 0; i < ndim; ++i) {
+        s[i] = x_fp32.size(i);
+        st[i] = x_fp32.stride(i);
+    }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim3 = {32, 1, 1};
@@ -107,8 +114,8 @@ torch::Tensor argmax_mlu(
         dim_size,
         static_cast<int>(ndim),
         static_cast<int>(dim),
-        shape_tensor.data_ptr<int>(),
-        stride_tensor.data_ptr<int>()
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]
     );
 
     return indices;
