@@ -1,19 +1,18 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cstdint>
 #include <limits>
 
-#define BLOCK_SIZE 1024  // 保留宏定义，实际未使用分块
+#define BLOCK_SIZE 1024  // 与原示例保持一致，此处未实际使用
 
 /**
- * @brief 内核：沿指定维度计算最大值索引
- * @param input        half 输入张量指针
- * @param output       int64_t 输出索引张量指针
- * @param pre          dim 之前各维度乘积
- * @param dim_size     dim 维度大小
- * @param post         dim 之后各维度乘积
- * @param total_output 输出元素总数
+ * @brief 内核：沿指定维度计算 half 张量的最大值索引
+ * @param input       输入张量指针（half）
+ * @param output      输出索引张量指针（int64_t）
+ * @param pre         dim 之前各维度元素总数
+ * @param dim_size    dim 维度长度
+ * @param post        dim 之后各维度元素总数
+ * @param total_output 输出张量元素总数
  */
 __mlu_entry__ void argmax_kernel(half *input, int64_t *output,
                                  int pre, int dim_size, int post,
@@ -21,15 +20,16 @@ __mlu_entry__ void argmax_kernel(half *input, int64_t *output,
     uint32_t task_id = taskId;
     uint32_t task_num = taskDim;
 
-    // 每个任务处理多个输出元素（轮询方式）
+    // 每个任务处理多个输出元素（轮询分配）
     for (int idx = task_id; idx < total_output; idx += task_num) {
-        int pre_idx = idx / post;
-        int post_idx = idx % post;
-        int base = (pre_idx * dim_size * post) + post_idx;
+        int pre_idx = idx / post;          // 当前输出在 pre 维度的序号
+        int post_idx = idx % post;         // 当前输出在 post 维度的序号
+        int base = (pre_idx * dim_size * post) + post_idx;  // 输入中对应向量的起始偏移
 
         float max_val = -std::numeric_limits<float>::infinity();
         int max_idx = 0;
 
+        // 遍历 dim 维度上的所有元素
         for (int k = 0; k < dim_size; ++k) {
             float cur = __half2float(input[base + k * post]);
             if (cur > max_val) {
@@ -37,44 +37,47 @@ __mlu_entry__ void argmax_kernel(half *input, int64_t *output,
                 max_idx = k;
             }
         }
-        output[idx] = max_idx;
+        output[idx] = max_idx;  // 写入输出索引
     }
 }
 
 /**
- * @brief PyTorch 接口函数（名称必须为 bang_func）
- * @param x   输入张量，连续布局，torch::kFloat16
- * @param dim 要规约的维度
- * @return    输出索引张量，torch::kInt64，形状移除 dim 后
+ * @brief PyTorch 接口函数（与测试框架要求的符号名和参数类型严格一致）
+ * @param x   输入张量，类型 torch::kFloat16，连续内存布局
+ * @param dim 要规约的维度，类型 int（注意不是 int64_t）
+ * @return    输出索引张量，类型 torch::kInt64，形状为移除 dim 后的形状
  */
-torch::Tensor bang_func(torch::Tensor x, int64_t dim) {
+torch::Tensor bang_func(torch::Tensor x, int dim) {
     TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "Input must be float16");
-    TORCH_CHECK(dim >= 0 && dim < x.dim(), "Dimension out of range");
+    int64_t ndim = x.dim();
+    TORCH_CHECK(dim >= 0 && dim < ndim, "Dimension out of range");
 
     // 计算 pre, dim_size, post
     int64_t pre = 1, dim_size = x.size(dim), post = 1;
     for (int64_t i = 0; i < dim; ++i) pre *= x.size(i);
-    for (int64_t i = dim + 1; i < x.dim(); ++i) post *= x.size(i);
+    for (int64_t i = dim + 1; i < ndim; ++i) post *= x.size(i);
     int64_t total_output = pre * post;
 
-    // 构建输出形状
+    // 构造输出形状
     std::vector<int64_t> out_shape;
-    for (int64_t i = 0; i < x.dim(); ++i) {
+    for (int64_t i = 0; i < ndim; ++i) {
         if (i != dim) out_shape.push_back(x.size(i));
     }
     auto out_opts = torch::TensorOptions().dtype(torch::kInt64).device(x.device());
     torch::Tensor output = torch::empty(out_shape, out_opts);
 
-    // 获取 MLU 队列
+    // 获取 MLU 流队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 设置并行维度：使用 Union1 类型，任务数 = 输出元素总数（可设上限）
-    uint32_t task_count = (uint32_t)total_output;
-    cnrtDim3_t dim3 = {task_count, 1, 1};
+    // 设置并行任务数（与原示例类似，使用固定 cluster 数量，每个 cluster 包含多个 task）
+    // 注意：硬件任务数有限，因此这里使用固定数量（例如 16 或 64），每个任务循环处理多个输出
+    // 但为了简单且兼容原示例风格，也可以使用 total_output 个任务（仅适用于小规模测试）
+    // 更健壮的做法是使用固定 cluster 数量 + 轮询。这里选择固定 cluster 数量为 16（与原示例一致）
+    uint32_t cluster_num = 16;          // 与原示例的 dim.x 相同
+    cnrtDim3_t dim3 = {cluster_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // 启动内核
     argmax_kernel<<<dim3, ktype, queue>>>(
         reinterpret_cast<half*>(x.data_ptr<at::Half>()),
         output.data_ptr<int64_t>(),

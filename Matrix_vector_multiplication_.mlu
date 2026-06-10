@@ -18,8 +18,8 @@ __mlu_entry__ void gemv_kernel(
     uint32_t start_row = task_id * per_task + (task_id < remainder ? task_id : remainder);
     uint32_t count = per_task + (task_id < remainder ? 1 : 0);
 
-    // 使用 double 累加器，存储每个行的部分和（NRAM 上）
-    __nram__ double accs[1024];  // 1024 足够，若 count 更大可增加
+    // 使用 double 累加器（NRAM 上）
+    __nram__ double accs[1024];   // 1024 足够覆盖常见 count
     for (uint32_t i = 0; i < count; ++i) {
         accs[i] = 0.0;
     }
@@ -27,39 +27,33 @@ __mlu_entry__ void gemv_kernel(
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
 
-    // 外层循环：遍历 K 维度的每个块
+    // 外层循环：K 分块
     for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
         uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
 
-        // 1. 加载 B 的当前块（所有行共享）
+        // 加载 B 的当前块（所有行共享）
         __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
 
-        // 2. 对本任务负责的所有行，处理当前块
+        // 对内层所有行处理
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t row = start_row + i;
-
-            // 加载 A 当前行对应的块
             __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
 
             // 向量逐元素乘法
             __bang_mul(nram_a, nram_a, nram_b, len);
 
-            // Kahan 补偿求和，累加到 double 累加器
+            // 手工累加，累加到 double 变量
             double sum = accs[i];
-            float comp = 0.0f;
             for (uint32_t j = 0; j < len; ++j) {
-                float y = nram_a[j] - comp;
-                double t = sum + y;
-                comp = (float)(t - sum) - y;
-                sum = t;
+                sum += (double)nram_a[j];   // 显式转为 double 避免精度丢失
             }
             accs[i] = sum;
         }
     }
 
-    // 写回结果（double -> float）
+    // 写回结果
     for (uint32_t i = 0; i < count; ++i) {
-        C[start_row + i] = (float)accs[i];
+        C[start_row + i] = (float)accs[i];  // double -> float
     }
 }
 
@@ -87,7 +81,7 @@ torch::Tensor bang_func(
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {32, 1, 1};          // 32 个任务，可根据 MLU 核心数调整
+    cnrtDim3_t dim = {32, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     gemv_kernel<<<dim, ktype, queue>>>(
