@@ -2,17 +2,36 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#include "framework/core/MLUStream.h"
+
+#include <cstdint>
+#include <climits>
+
 #define CHUNK_SIZE 4096
 #define CORE_NUM 4
 
-__mlu_entry__ void mse_kernel(
+#define CNRT_CHECK_RET(expr)                                      \
+    do {                                                          \
+        cnrtRet_t ret = (expr);                                   \
+        TORCH_CHECK(ret == CNRT_RET_SUCCESS,                      \
+                    "CNRT error, ret = ", static_cast<int>(ret)); \
+    } while (0)
+
+
+__mlu_entry__ void mse_partial_kernel(
     float *predictions,
     float *targets,
-    float *output,
-    int total) {
+    float *partial_output,
+    int total,
+    int core_num_arg) {
 
     uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+    uint32_t core_num = core_num_arg;
+
+    if (core_id >= core_num) {
+        return;
+    }
+
     uint32_t per_core = total / core_num;
     uint32_t remainder = total % core_num;
 
@@ -29,7 +48,6 @@ __mlu_entry__ void mse_kernel(
     float local_sum = 0.0f;
 
     for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-
         uint32_t len =
             (offset + CHUNK_SIZE <= count)
                 ? CHUNK_SIZE
@@ -47,29 +65,44 @@ __mlu_entry__ void mse_kernel(
             len * sizeof(float),
             GDRAM2NRAM);
 
-        for (uint32_t i = len; i < CHUNK_SIZE; i++) {
-            nram_pred[i] = 0.0f;
-            nram_targ[i] = 0.0f;
-        }
-
         __bang_sub(
             nram_diff,
             nram_pred,
             nram_targ,
-            CHUNK_SIZE);
+            len);
 
         __bang_mul(
             nram_diff,
             nram_diff,
             nram_diff,
-            CHUNK_SIZE);
+            len);
 
         for (uint32_t i = 0; i < len; i++) {
             local_sum += nram_diff[i];
         }
     }
 
-    output[core_id] = local_sum;
+    partial_output[core_id] = local_sum;
+}
+
+
+__mlu_entry__ void mse_reduce_kernel(
+    float *partial_output,
+    float *output,
+    int total,
+    int core_num_arg) {
+
+    if (taskId != 0) {
+        return;
+    }
+
+    float global_sum = 0.0f;
+
+    for (int i = 0; i < core_num_arg; i++) {
+        global_sum += partial_output[i];
+    }
+
+    output[0] = global_sum / (float)total;
 }
 
 
@@ -78,50 +111,84 @@ torch::Tensor bang_func(
     torch::Tensor targets) {
 
     TORCH_CHECK(
+        predictions.sizes() == targets.sizes(),
+        "predictions and targets must have the same shape");
+
+    TORCH_CHECK(
         predictions.is_contiguous(),
-        "Predictions must be contiguous");
+        "predictions must be contiguous");
+
     TORCH_CHECK(
         targets.is_contiguous(),
-        "Targets must be contiguous");
+        "targets must be contiguous");
+
+    TORCH_CHECK(
+        predictions.device() == targets.device(),
+        "predictions and targets must be on the same device");
+
+    TORCH_CHECK(
+        predictions.numel() > 0,
+        "MSE input must not be empty");
+
+    TORCH_CHECK(
+        predictions.numel() <= INT_MAX,
+        "input tensor is too large");
 
     auto original_dtype = predictions.scalar_type();
 
     torch::Tensor pred_fp32 = predictions;
     torch::Tensor targ_fp32 = targets;
-    if (original_dtype != torch::kFloat) {
+
+    if (predictions.scalar_type() != torch::kFloat) {
         pred_fp32 = predictions.to(torch::kFloat);
+    }
+
+    if (targets.scalar_type() != torch::kFloat) {
         targ_fp32 = targets.to(torch::kFloat);
     }
 
-    int total = pred_fp32.numel();
+    pred_fp32 = pred_fp32.contiguous();
+    targ_fp32 = targ_fp32.contiguous();
+
+    int total = static_cast<int>(pred_fp32.numel());
+
+    auto float_options = torch::TensorOptions()
+                             .dtype(torch::kFloat)
+                             .device(pred_fp32.device());
+
+    auto partial_output = torch::empty(
+        {CORE_NUM},
+        float_options);
 
     auto output_fp32 = torch::empty(
-        {CORE_NUM},
-        torch::TensorOptions()
-            .dtype(torch::kFloat)
-            .device(pred_fp32.device()));
+        {1},
+        float_options);
 
-    cnrtQueue_t queue = nullptr;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {CORE_NUM, 1, 1};
-    cnrtFunctionType_t ktype =
-        cnrtFuncTypeUnion1;
+    cnrtDim3_t dim_partial = {CORE_NUM, 1, 1};
+    cnrtDim3_t dim_reduce = {1, 1, 1};
 
-    mse_kernel<<<dim, ktype, queue>>>(
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    mse_partial_kernel<<<dim_partial, ktype, queue>>>(
         pred_fp32.data_ptr<float>(),
         targ_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        total);
+        partial_output.data_ptr<float>(),
+        total,
+        CORE_NUM);
 
-    auto output_cpu = output_fp32.cpu();
-    float global_sum = 0.0f;
-    for (int i = 0; i < CORE_NUM; i++) {
-        global_sum += output_cpu[i].item<float>();
+    mse_reduce_kernel<<<dim_reduce, ktype, queue>>>(
+        partial_output.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total,
+        CORE_NUM);
+
+    CNRT_CHECK_RET(cnrtQueueSync(queue));
+
+    if (original_dtype != torch::kFloat) {
+        output_fp32 = output_fp32.to(original_dtype);
     }
 
-    return torch::tensor(
-        global_sum / (float)total,
-        torch::TensorOptions()
-            .dtype(original_dtype)
-            .device(predictions.device()));
+    return output_fp32.reshape({});
 }

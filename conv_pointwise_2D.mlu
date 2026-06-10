@@ -1,0 +1,213 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#include "framework/core/MLUStream.h"
+
+#include <cstdint>
+
+#define CHUNK_SIZE 4096
+#define CORE_NUM 4
+
+#define CNRT_CHECK_RET(expr)                                      \
+    do {                                                          \
+        cnrtRet_t ret = (expr);                                   \
+        TORCH_CHECK(ret == CNRT_RET_SUCCESS,                      \
+                    "CNRT error, ret = ", static_cast<int>(ret)); \
+    } while (0)
+
+
+__mlu_entry__ void pointwise_conv2d_kernel(
+    float *x,
+    float *weight,
+    float *output,
+    int B,
+    int C,
+    int H,
+    int W,
+    int K,
+    int spatial,
+    int tile_num,
+    int total_units) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    uint32_t per_core = total_units / core_num;
+    uint32_t remainder = total_units % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_x[CHUNK_SIZE];
+    __nram__ float nram_w[CHUNK_SIZE];
+    __nram__ float nram_mul[CHUNK_SIZE];
+    __nram__ float nram_acc[CHUNK_SIZE];
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        uint32_t unit = start + idx;
+
+        uint32_t pair_id = unit / tile_num;
+        uint32_t tile_id = unit % tile_num;
+
+        uint32_t b = pair_id / K;
+        uint32_t k = pair_id % K;
+
+        uint32_t s0 = tile_id * CHUNK_SIZE;
+
+        uint32_t len =
+            (s0 + CHUNK_SIZE <= (uint32_t)spatial)
+                ? CHUNK_SIZE
+                : ((uint32_t)spatial - s0);
+
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        for (uint32_t j = 0; j < aligned_len; j++) {
+            nram_acc[j] = 0.0f;
+        }
+
+        for (uint32_t c = 0; c < (uint32_t)C; c++) {
+            float *x_ptr =
+                x + (((uint32_t)b * C + c) * spatial + s0);
+
+            __memcpy(
+                nram_x,
+                x_ptr,
+                len * sizeof(float),
+                GDRAM2NRAM);
+
+            for (uint32_t j = len; j < aligned_len; j++) {
+                nram_x[j] = 0.0f;
+            }
+
+            float w_value = weight[k * C + c];
+
+            for (uint32_t j = 0; j < aligned_len; j++) {
+                nram_w[j] = w_value;
+            }
+
+            __bang_mul(
+                nram_mul,
+                nram_x,
+                nram_w,
+                aligned_len);
+
+            __bang_add(
+                nram_acc,
+                nram_acc,
+                nram_mul,
+                aligned_len);
+        }
+
+        float *out_ptr =
+            output + (((uint32_t)b * K + k) * spatial + s0);
+
+        __memcpy(
+            out_ptr,
+            nram_acc,
+            len * sizeof(float),
+            NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor weight,
+    int padding,
+    int stride,
+    bool has_bias) {
+
+    TORCH_CHECK(
+        x.dim() == 4,
+        "x must be a 4D tensor with shape [B, C, H, W]");
+
+    TORCH_CHECK(
+        weight.dim() == 4,
+        "weight must be a 4D tensor with shape [K, C, 1, 1]");
+
+    TORCH_CHECK(
+        x.is_contiguous(),
+        "x must be contiguous");
+
+    TORCH_CHECK(
+        weight.is_contiguous(),
+        "weight must be contiguous");
+
+    TORCH_CHECK(
+        x.device() == weight.device(),
+        "x and weight must be on the same device");
+
+    int B = static_cast<int>(x.size(0));
+    int C = static_cast<int>(x.size(1));
+    int H = static_cast<int>(x.size(2));
+    int W = static_cast<int>(x.size(3));
+    int K = static_cast<int>(weight.size(0));
+
+    TORCH_CHECK(
+        B > 0 && C > 0 && H > 0 && W > 0 && K > 0,
+        "B, C, H, W, K must all be positive");
+
+    TORCH_CHECK(
+        weight.size(1) == C,
+        "weight in_channels must match x");
+
+    TORCH_CHECK(
+        weight.size(2) == 1 && weight.size(3) == 1,
+        "weight must be 1x1 kernel");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    torch::Tensor w_fp32 = weight;
+
+    if (x.scalar_type() != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+    }
+
+    if (weight.scalar_type() != torch::kFloat) {
+        w_fp32 = weight.to(torch::kFloat);
+    }
+
+    x_fp32 = x_fp32.contiguous();
+    w_fp32 = w_fp32.contiguous();
+
+    int spatial = H * W;
+    int tile_num = (spatial + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int total_units = B * K * tile_num;
+
+    auto output_fp32 = torch::empty(
+        {B, K, H, W},
+        torch::TensorOptions()
+            .dtype(torch::kFloat)
+            .device(x_fp32.device()));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {CORE_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    pointwise_conv2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        w_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        B,
+        C,
+        H,
+        W,
+        K,
+        spatial,
+        tile_num,
+        total_units);
+
+    CNRT_CHECK_RET(cnrtQueueSync(queue));
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}

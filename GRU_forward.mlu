@@ -1,0 +1,145 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+#include <cnrt.h>
+
+__mlu_entry__ void sigmoid_inplace_kernel(half *x, int n)
+{
+    uint32_t tid = taskId, tdim = taskDim;
+    uint32_t per = n / tdim, rem = n % tdim;
+    uint32_t start = tid * per + (tid < rem ? tid : rem);
+    uint32_t count = per + (tid < rem ? 1 : 0);
+    for (uint32_t i = 0; i < count; i++) {
+        float v = (float)x[start + i];
+        x[start + i] = (half)(1.0f / (1.0f + expf(-v)));
+    }
+}
+
+__mlu_entry__ void tanh_inplace_kernel(half *x, int n)
+{
+    uint32_t tid = taskId, tdim = taskDim;
+    uint32_t per = n / tdim, rem = n % tdim;
+    uint32_t start = tid * per + (tid < rem ? tid : rem);
+    uint32_t count = per + (tid < rem ? 1 : 0);
+    for (uint32_t i = 0; i < count; i++) {
+        float v = (float)x[start + i];
+        x[start + i] = (half)tanhf(v);
+    }
+}
+
+__mlu_entry__ void mul_inplace_kernel(half *a, const half *b, int n)
+{
+    uint32_t tid = taskId, tdim = taskDim;
+    uint32_t per = n / tdim, rem = n % tdim;
+    uint32_t start = tid * per + (tid < rem ? tid : rem);
+    uint32_t count = per + (tid < rem ? 1 : 0);
+    for (uint32_t i = 0; i < count; i++) {
+        a[start + i] = (half)((float)a[start + i] * (float)b[start + i]);
+    }
+}
+
+__mlu_entry__ void gru_update_kernel(
+    half *h_out, const half *z, const half *n_gate, const half *h_prev, int n)
+{
+    uint32_t tid = taskId, tdim = taskDim;
+    uint32_t per = n / tdim, rem = n % tdim;
+    uint32_t start = tid * per + (tid < rem ? tid : rem);
+    uint32_t count = per + (tid < rem ? 1 : 0);
+    for (uint32_t i = 0; i < count; i++) {
+        float z_v = (float)z[start + i];
+        float n_v = (float)n_gate[start + i];
+        float h_v = (float)h_prev[start + i];
+        h_out[start + i] = (half)((1.0f - z_v) * n_v + z_v * h_v);
+    }
+}
+
+static torch::Tensor gru_layer_forward(
+    torch::Tensor x,
+    torch::Tensor weight_ih,
+    torch::Tensor weight_hh,
+    torch::Tensor bias_ih,
+    torch::Tensor bias_hh,
+    int hidden_size,
+    cnrtQueue_t queue)
+{
+    int batch = x.size(0);
+    int seq_len = x.size(1);
+    int n_elem = batch * hidden_size;
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    auto h = torch::zeros({batch, hidden_size}, x.options());
+    auto output = torch::empty({batch, seq_len, hidden_size}, x.options());
+
+    auto x_flat = x.reshape({batch * seq_len, x.size(2)});
+    auto gates_ih = x_flat.mm(weight_ih.t()).add_(bias_ih);
+    gates_ih = gates_ih.reshape({batch, seq_len, 3 * hidden_size});
+
+    for (int t = 0; t < seq_len; t++) {
+        auto g_ih = gates_ih.select(1, t).contiguous();
+        auto g_hh = h.mm(weight_hh.t()).add_(bias_hh);
+
+        auto r = (g_ih.narrow(1, 0, hidden_size) +
+                  g_hh.narrow(1, 0, hidden_size)).contiguous();
+        sigmoid_inplace_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<half *>(r.data_ptr<at::Half>()), n_elem);
+
+        auto z = (g_ih.narrow(1, hidden_size, hidden_size) +
+                  g_hh.narrow(1, hidden_size, hidden_size)).contiguous();
+        sigmoid_inplace_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<half *>(z.data_ptr<at::Half>()), n_elem);
+
+        auto n_hh = g_hh.narrow(1, 2 * hidden_size, hidden_size).contiguous();
+        mul_inplace_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<half *>(n_hh.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(r.data_ptr<at::Half>()),
+            n_elem);
+
+        auto n_gate = (g_ih.narrow(1, 2 * hidden_size, hidden_size) + n_hh).contiguous();
+        tanh_inplace_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<half *>(n_gate.data_ptr<at::Half>()), n_elem);
+
+        auto h_new = torch::empty_like(h);
+        gru_update_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<half *>(h_new.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(z.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(n_gate.data_ptr<at::Half>()),
+            reinterpret_cast<const half *>(h.data_ptr<at::Half>()),
+            n_elem);
+        h = h_new;
+        output.select(1, t).copy_(h);
+    }
+
+    return output.contiguous();
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor weight_ih_l0,
+    torch::Tensor weight_hh_l0,
+    torch::Tensor bias_ih_l0,
+    torch::Tensor bias_hh_l0,
+    torch::Tensor weight_ih_l1,
+    torch::Tensor weight_hh_l1,
+    torch::Tensor bias_ih_l1,
+    torch::Tensor bias_hh_l1,
+    int input_size,
+    int hidden_size,
+    int num_layers)
+{
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "x must be [batch, seq_len, input_size]");
+    TORCH_CHECK(num_layers == 2, "expects num_layers == 2");
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    auto out0 = gru_layer_forward(x,
+        weight_ih_l0, weight_hh_l0, bias_ih_l0, bias_hh_l0,
+        hidden_size, queue);
+
+    auto out1 = gru_layer_forward(out0,
+        weight_ih_l1, weight_hh_l1, bias_ih_l1, bias_hh_l1,
+        hidden_size, queue);
+
+    return out1;
+}

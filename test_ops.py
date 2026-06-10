@@ -54,10 +54,25 @@ OPS_META = {
         "extra": {},
     },
     "MSE_Loss": {
-        "file": "MSE_Loss.mlu",
+        "file": "103_MSE_Loss.mlu",
         "args": ["predictions", "targets"],
         "ref": lambda pred, targ: torch.nn.functional.mse_loss(pred, targ),
         "shape": (1024, 256),
+        "extra": {},
+    },
+    "Scatter_add": {
+        "file": "105_Scatter_add.mlu",
+        "args": ["src", "index", "dim_size"],
+        "ref": lambda src, idx, ds: torch.zeros(ds, src.size(1))
+        .index_add_(0, idx.to(torch.int32) % ds, src),
+        "shape": [(1024, 256), (1024,)],
+        "extra": {"dim_size": 512},
+    },
+    "PointwiseConv2d": {
+        "file": "104_PointwiseConv2d.mlu",
+        "args": ["x", "weight"],
+        "ref": lambda x, w, bias=None: torch.nn.functional.conv2d(x, w, bias),
+        "shape": [(2, 64, 32, 32), (128, 64, 1, 1)],
         "extra": {},
     },
 }
@@ -67,6 +82,8 @@ NUM_TO_NAME = {
     "001": "LeakyReLU",
     "070": "Sqrt",
     "103": "MSE_Loss",
+    "104": "PointwiseConv2d",
+    "105": "Scatter_add",
 }
 
 
@@ -100,6 +117,15 @@ def _extract_bang_func_params(mlu_path):
     for part in params_str.split(","):
         part = part.strip()
         if part:
+            depth = 0
+            for i, ch in enumerate(part):
+                if ch == '<':
+                    depth += 1
+                elif ch == '>':
+                    depth -= 1
+                elif ch == '=' and depth == 0:
+                    part = part[:i].strip()
+                    break
             params.append(part)
     return params
 
@@ -152,14 +178,26 @@ def compile_and_load(mlu_path):
     # ---------- Step 2: 生成包装器 + torch cpp_extension 链接 ----------
     params = _extract_bang_func_params(mlu_path)
     param_str = ", ".join(params) if params else ""
+
+    py_args = []
+    for p in params:
+        parts = p.rsplit(None, 1)
+        ptype, pname = parts if len(parts) == 2 else (p, "")
+        if ptype == "c10::optional<torch::Tensor>":
+            py_args.append(f'py::arg("{pname}") = py::none()')
+        else:
+            py_args.append(f'py::arg("{pname}")')
+    py_args_str = ", ".join(py_args)
+
     wrapper_code = f"""\
 #include <torch/extension.h>
+namespace py = pybind11;
 
 // bang_func 在 .o 中定义，此处仅做声明供 pybind11 绑定
 torch::Tensor bang_func({param_str});
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-    m.def("bang_func", &bang_func, "BANG C kernel entry");
+    m.def("bang_func", &bang_func, {py_args_str});
 }}
 """
     wrapper_path = mlu_path.parent / f"{stem}_wrapper.cpp"
@@ -216,20 +254,24 @@ def test_operator(name, meta, device="mlu"):
 
     # 生成测试数据
     torch.manual_seed(42)
-    inputs_cpu = [torch.randn(*shape) for _ in range(len(args) - len(extra))]
+    if isinstance(shape, list):
+        inputs_cpu = [torch.randn(*s) for s in shape]
+    else:
+        inputs_cpu = [torch.randn(*shape) for _ in range(len(args) - len(extra))]
     inputs_mlu = [t.to(device) for t in inputs_cpu]
 
     # 运行 MLU kernel（预热 + 计时）
     bang_func = module.bang_func
+    extra_vals = list(extra.values())
     with torch.no_grad():
         for _ in range(3):
-            bang_func(*inputs_mlu, **extra)
+            bang_func(*inputs_mlu, *extra_vals)
         torch.mlu.synchronize()
 
         N_ITER = 100
         t0 = time.perf_counter()
         for _ in range(N_ITER):
-            result_mlu = bang_func(*inputs_mlu, **extra)
+            result_mlu = bang_func(*inputs_mlu, *extra_vals)
         torch.mlu.synchronize()
         mlu_time_ms = (time.perf_counter() - t0) / N_ITER * 1000
 
@@ -238,7 +280,7 @@ def test_operator(name, meta, device="mlu"):
     with torch.no_grad():
         t0 = time.perf_counter()
         for _ in range(N_ITER):
-            result_ref = ref_fn(*inputs_cpu, **extra)
+            result_ref = ref_fn(*inputs_cpu, *extra_vals)
         torch_time_ms = (time.perf_counter() - t0) / N_ITER * 1000
 
     # 精度对比
@@ -251,6 +293,29 @@ def test_operator(name, meta, device="mlu"):
     else:
         ok = True
         print(f"  精度: 参考输出为空，跳过对比")
+
+    # 确定性验证 (Scatter_add 专用)
+    if name == "Scatter_add":
+        print("  确定性验证: src=ones(1024,256) index=zeros(1024) ...")
+        N, D, ds = 1024, 256, 512
+        val_src = torch.ones(N, D, device=device)
+        val_idx = torch.zeros(N, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            val_out = bang_func(val_src, val_idx, ds).cpu()
+        expected = torch.zeros(ds, D)
+        expected[0, :] = float(N)
+        val_diff = (val_out - expected).abs().max().item()
+        val_ok = val_diff <= 1e-2
+        val_status = "PASS" if val_ok else "FAIL"
+        print(f"  确定性: max_diff={val_diff:.6f}  [{val_status}]")
+        if not val_ok:
+            print(f"    输出行0前10个值: {val_out[0, :10].tolist()}")
+            print(f"    期望: {expected[0, :10].tolist()}")
+            val_sum = val_out.sum().item()
+            print(f"    输出总和={val_sum:.2f} (期望={float(N * D):.2f})")
+            ok = False
+        elif not ok:
+            print(f"    确定性测试通过，但随机数据精度超标——问题出在index取模/边界处理")
 
     # 性能对比
     if torch_time_ms > 0:
