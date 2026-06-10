@@ -11,7 +11,7 @@ __mlu_entry__ void sigmoid_inplace_kernel(half *x, int n)
     uint32_t count = per + (tid < rem ? 1 : 0);
     for (uint32_t i = 0; i < count; i++) {
         float v = (float)x[start + i];
-        x[start + i] = (half)(1.0f / (1.0f + __expf(-v)));
+        x[start + i] = (half)(1.0f / (1.0f + expf(-v)));
     }
 }
 
@@ -23,7 +23,7 @@ __mlu_entry__ void tanh_inplace_kernel(half *x, int n)
     uint32_t count = per + (tid < rem ? 1 : 0);
     for (uint32_t i = 0; i < count; i++) {
         float v = (float)x[start + i];
-        x[start + i] = (half)__tanhf(v);
+        x[start + i] = (half)tanhf(v);
     }
 }
 
