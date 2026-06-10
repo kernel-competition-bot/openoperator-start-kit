@@ -1,11 +1,7 @@
 #include "bang.h"
 #include "cnrt.h"
-#include <torch/extension.h>
-#include <torch_mlu/csrc/aten/utils/cnnl_util.h>
 
-#define NRAM_SIZE (1024 * 128)
-#define NRAM_ELEM (NRAM_SIZE / 4)
-#define BUF_SIZE (NRAM_ELEM / 4)
+#define BUF_SIZE 8192
 
 __mlu_entry__ void leaky_relu_kernel(float *input, float *output, int num_elements, float negative_slope) {
     int per_task = num_elements / taskDim;
@@ -17,22 +13,20 @@ __mlu_entry__ void leaky_relu_kernel(float *input, float *output, int num_elemen
     __nram__ float nram_src[BUF_SIZE];
     __nram__ float nram_dst[BUF_SIZE];
     __nram__ float nram_tmp[BUF_SIZE];
-    __nram__ float nram_mask[BUF_SIZE];
 
-    int max_deal = BUF_SIZE / 64 * 64;
     int offset = start;
     int remain = len;
 
     while (remain > 0) {
-        int deal_num = remain > max_deal ? max_deal : remain;
+        int deal_num = remain > BUF_SIZE ? BUF_SIZE : remain;
         int align_num = (deal_num + 63) / 64 * 64;
 
         __memcpy(nram_src, input + offset, deal_num * sizeof(float), GDRAM2NRAM);
 
-        // dst = relu(x), gets max(0, x)
+        // dst = relu(x) = max(0, x)
         __bang_active_relu(nram_dst, nram_src, align_num);
 
-        // tmp = x - relu(x), gets min(0, x) i.e. negative part
+        // tmp = x - relu(x) = min(0, x), the negative part
         __bang_sub(nram_tmp, nram_src, nram_dst, align_num);
 
         // tmp = negative_part * negative_slope
@@ -48,6 +42,9 @@ __mlu_entry__ void leaky_relu_kernel(float *input, float *output, int num_elemen
     }
 }
 
+#include <torch/extension.h>
+#include "torch_mlu/csrc/aten/utils/cnnl_util.h"
+
 torch::Tensor bang_func(torch::Tensor input, float negative_slope) {
     auto output = torch::empty_like(input);
     int num_elements = input.numel();
@@ -58,7 +55,7 @@ torch::Tensor bang_func(torch::Tensor input, float negative_slope) {
     dim.y = 1;
     dim.z = 1;
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    auto queue = torch_mlu::getQueueFromPool();
 
     leaky_relu_kernel<<<dim, func_type, queue>>>(
         (float *)input.data_ptr(),
