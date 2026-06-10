@@ -1,70 +1,52 @@
 #include "bang.h"
 #include "cnrt.h"
+#include <torch/torch.h>
 
-#define BUF_SIZE 8192
+#define NRAM_MAX_SIZE 1024 * 128
+#define ELEM_COUNT (NRAM_MAX_SIZE / sizeof(float))
 
-__mlu_entry__ void leaky_relu_kernel(float *input, float *output, int num_elements, float negative_slope) {
-    int per_task = num_elements / taskDim;
+__mlu_global__ void leaky_relu_kernel(float* input, float* output, int num_elements, float negative_slope) {
+    __nram__ float nram_input[ELEM_COUNT];
+    __nram__ float nram_temp[ELEM_COUNT];
+
+    int task_size = num_elements / taskDim;
     int remainder = num_elements % taskDim;
-    int start = taskId * per_task + (taskId < remainder ? taskId : remainder);
-    int len = per_task + (taskId < remainder ? 1 : 0);
-    if (len <= 0) return;
+    int start = taskId * task_size + (taskId < remainder ? taskId : remainder);
+    int len = task_size + (taskId < remainder ? 1 : 0);
 
-    __nram__ float nram_src[BUF_SIZE];
-    __nram__ float nram_dst[BUF_SIZE];
-    __nram__ float nram_tmp[BUF_SIZE];
+    for (int offset = 0; offset < len; offset += ELEM_COUNT) {
+        int cur_len = (offset + ELEM_COUNT <= len) ? ELEM_COUNT : (len - offset);
+        int align_len = (cur_len + 63) / 64 * 64;
 
-    int offset = start;
-    int remain = len;
+        __memcpy(nram_input, input + start + offset, cur_len * sizeof(float), GDRAM2NRAM);
 
-    while (remain > 0) {
-        int deal_num = remain > BUF_SIZE ? BUF_SIZE : remain;
-        int align_num = (deal_num + 63) / 64 * 64;
+        // nram_temp = nram_input * negative_slope
+        __bang_mul_const(nram_temp, nram_input, negative_slope, align_len);
+        // output = (input >= 0) ? input : input * negative_slope
+        __bang_maxequal(nram_temp, nram_temp, nram_input, align_len);
 
-        __memcpy(nram_src, input + offset, deal_num * sizeof(float), GDRAM2NRAM);
-
-        // dst = relu(x) = max(0, x)
-        __bang_active_relu(nram_dst, nram_src, align_num);
-
-        // tmp = x - relu(x) = min(0, x), the negative part
-        __bang_sub(nram_tmp, nram_src, nram_dst, align_num);
-
-        // tmp = negative_part * negative_slope
-        __bang_mul_scalar(nram_tmp, nram_tmp, negative_slope, align_num);
-
-        // result = relu(x) + negative_part * slope
-        __bang_add(nram_dst, nram_dst, nram_tmp, align_num);
-
-        __memcpy(output + offset, nram_dst, deal_num * sizeof(float), NRAM2GDRAM);
-
-        offset += deal_num;
-        remain -= deal_num;
+        __memcpy(output + start + offset, nram_temp, cur_len * sizeof(float), NRAM2GDRAM);
     }
 }
-
-#include <torch/extension.h>
-#include "torch_mlu/csrc/aten/utils/cnnl_util.h"
 
 torch::Tensor bang_func(torch::Tensor input, float negative_slope) {
     auto output = torch::empty_like(input);
     int num_elements = input.numel();
 
+    cnrtQueue_t queue;
+    cnrtQueueCreate(&queue);
+
     cnrtDim3_t dim;
-    cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_UNION1;
     dim.x = 4;
     dim.y = 1;
     dim.z = 1;
-
-    auto queue = torch_mlu::getQueueFromPool();
+    cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_BLOCK;
 
     leaky_relu_kernel<<<dim, func_type, queue>>>(
-        (float *)input.data_ptr(),
-        (float *)output.data_ptr(),
-        num_elements,
-        negative_slope
-    );
+        input.data_ptr<float>(), output.data_ptr<float>(), num_elements, negative_slope);
 
     cnrtQueueSync(queue);
+    cnrtQueueDestroy(queue);
 
     return output;
 }
