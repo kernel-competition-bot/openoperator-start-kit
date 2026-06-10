@@ -2,120 +2,80 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define BLOCK_SIZE 1024
+#define CHUNK_SIZE 4096
 
-// ===================== 余弦算子 =====================
-__mlu_entry__ void cos_kernel(half *input, half *output, int total) {
-    uint32_t task_id = taskId;
-    uint32_t task_num = taskDim;
-    uint32_t start = task_id * BLOCK_SIZE;
-    uint32_t stride = task_num * BLOCK_SIZE;
+__mlu_entry__ void cos_kernel(
+    float *input,
+    float *output,
+    int total) {
 
-    __nram__ half buffer[BLOCK_SIZE];
-    __nram__ float float_buffer[BLOCK_SIZE];
+    // 多核拆分 —— 按元素拆分
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
 
-    for (uint32_t offset = start; offset < (uint32_t)total; offset += stride) {
-        uint32_t remain = (uint32_t)total - offset;
-        uint32_t len = remain > BLOCK_SIZE ? BLOCK_SIZE : remain;
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_in[CHUNK_SIZE];
+    __nram__ float nram_out[CHUNK_SIZE];
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count)
+                           ? CHUNK_SIZE
+                           : (count - offset);
+
         uint32_t aligned_len = (len + 63) & ~63;
 
-        __memcpy(buffer, input + offset, len * sizeof(half), GDRAM2NRAM);
-        if (aligned_len > len) {
-            for (uint32_t i = len; i < aligned_len; ++i) {
-                buffer[i] = (half)0.0f;
-            }
-        }
-        __bang_half2float(float_buffer, buffer, aligned_len);
-        __bang_cos(float_buffer, float_buffer, aligned_len);   // 逐元素余弦
-        __bang_float2half(buffer, float_buffer, aligned_len);
-        __memcpy(output + offset, buffer, len * sizeof(half), NRAM2GDRAM);
+        __memcpy(
+            nram_in,
+            input + start + offset,
+            len * sizeof(float),
+            GDRAM2NRAM);
+
+        // BangC 内置余弦函数
+        __bang_cos(
+            nram_out,
+            nram_in,
+            aligned_len);
+
+        __memcpy(
+            output + start + offset,
+            nram_out,
+            len * sizeof(float),
+            NRAM2GDRAM);
     }
 }
 
-torch::Tensor bang_cos(torch::Tensor input) {
-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat16, "input must be float16");
 
-    auto output = torch::empty_like(input);
-    int total = input.numel();
+torch::Tensor cos_func(torch::Tensor input) {
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {16, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
 
-    cos_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half *>(input.data_ptr<at::Half>()),
-        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
-        total);
-
-    return output;
-}
-
-// ===================== Argmax 算子（沿最后一维） =====================
-__mlu_entry__ void argmax_kernel(half *input, int *output, int batch, int dim) {
-    uint32_t task_id = taskId;
-    uint32_t task_num = taskDim;
-
-    __nram__ half buffer[BLOCK_SIZE];
-    __nram__ float float_buffer[BLOCK_SIZE];
-
-    for (uint32_t b = task_id; b < (uint32_t)batch; b += task_num) {
-        half *row = input + b * dim;
-        float max_val = (float)row[0];
-        int max_idx = 0;
-        uint32_t offset = 0;
-
-        while (offset < (uint32_t)dim) {
-            uint32_t remain = (uint32_t)dim - offset;
-            uint32_t len = remain > BLOCK_SIZE ? BLOCK_SIZE : remain;
-            uint32_t aligned_len = (len + 63) & ~63;
-
-            __memcpy(buffer, row + offset, len * sizeof(half), GDRAM2NRAM);
-            if (aligned_len > len) {
-                for (uint32_t i = len; i < aligned_len; ++i) {
-                    buffer[i] = (half)0.0f;
-                }
-            }
-            __bang_half2float(float_buffer, buffer, aligned_len);
-
-            // 查找当前块中的最大值及其索引（只考虑有效元素）
-            float max_local = float_buffer[0];
-            int local_idx = 0;
-            for (uint32_t i = 1; i < len; ++i) {
-                if (float_buffer[i] > max_local) {
-                    max_local = float_buffer[i];
-                    local_idx = i;
-                }
-            }
-            if (max_local > max_val) {
-                max_val = max_local;
-                max_idx = offset + local_idx;
-            }
-            offset += len;
-        }
-        output[b] = max_idx;
+    auto original_dtype = input.scalar_type();
+    torch::Tensor input_fp32 = input;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
     }
-}
 
-torch::Tensor bang_argmax(torch::Tensor input, int64_t dim) {
-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-    TORCH_CHECK(input.scalar_type() == torch::kFloat16, "input must be float16");
-    TORCH_CHECK(dim == 1, "only support dim=1 for [batch, dim] tensor"); // 根据题目输入形状简化
-    TORCH_CHECK(input.dim() == 2, "input must be 2D tensor [batch, dim]");
+    auto output_fp32 = torch::empty_like(input_fp32);
+    int total = input_fp32.numel();
 
-    int batch = input.size(0);
-    int feature_dim = input.size(1);
-    auto output = torch::empty({batch}, torch::dtype(torch::kInt32).device(input.device()));
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim_grid = {16, 1, 1};
+    cnrtQueue_t queue = nullptr;
+    cnrtDim3_t dim3 = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    argmax_kernel<<<dim_grid, ktype, queue>>>(
-        reinterpret_cast<half *>(input.data_ptr<at::Half>()),
-        output.data_ptr<int>(),
-        batch,
-        feature_dim);
+    cos_kernel<<<dim3, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total
+    );
 
-    return output;
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
 }

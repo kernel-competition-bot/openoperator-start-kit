@@ -15,42 +15,54 @@ __mlu_entry__ void gemv_kernel(
     uint32_t task_num = taskDim;
     uint32_t per_task = M / task_num;
     uint32_t remainder = M % task_num;
-    uint32_t start_row = task_id * per_task +
-                         (task_id < remainder ? task_id : remainder);
-    uint32_t count = per_task +
-                     (task_id < remainder ? 1 : 0);
+    uint32_t start_row = task_id * per_task + (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task + (task_id < remainder ? 1 : 0);
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
-    __nram__ float sum_tmp;   // 用于存储规约结果
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t row = start_row + i;
         float acc = 0.0f;
+        float comp = 0.0f;          // Kahan 补偿项
 
         for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
             uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
-            uint32_t aligned_len = (len + 63) & ~63;  // 对齐到64的倍数
+            uint32_t aligned_len = (len + 63) & ~63;   // 对齐到64的倍数，满足向量指令要求
 
-            // 加载 B 片段并清零尾部
+            // 1. 加载 B 片段
             __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
             for (uint32_t j = len; j < aligned_len; ++j) nram_b[j] = 0.0f;
 
-            // 加载 A 当前行片段并清零尾部
+            // 2. 加载 A 当前行片段
             __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
             for (uint32_t j = len; j < aligned_len; ++j) nram_a[j] = 0.0f;
 
-            // 向量逐元素乘法
+            // 3. 向量乘法
             __bang_mul(nram_a, nram_a, nram_b, aligned_len);
 
-            // 硬件归约求和，结果存入 sum_tmp
-            __bang_reduce_sum(&sum_tmp, nram_a, aligned_len);
-            acc += sum_tmp;
+            // 4. Kahan 补偿求和（当前块的部分和）
+            float partial_sum = 0.0f;
+            float partial_comp = 0.0f;
+            for (uint32_t j = 0; j < len; ++j) {
+                float y = nram_a[j] - partial_comp;
+                float t = partial_sum + y;
+                partial_comp = (t - partial_sum) - y;
+                partial_sum = t;
+            }
+
+            // 5. 将当前块的部分和合并到全局累加器（再次使用 Kahan）
+            float y = partial_sum - comp;
+            float t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
         }
+
         C[row] = acc;
     }
 }
 
+// Python 入口函数（必须与 load_inline 期望的函数名一致）
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
@@ -59,13 +71,12 @@ torch::Tensor bang_func(
     TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor [M, K]");
     TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be a 2D tensor [K, 1]");
-    TORCH_CHECK(A.size(1) == B.size(0),
-                "Inner dimensions must match: A.shape[1] == B.shape[0]");
+    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
 
     int M = A.size(0);
     int K = A.size(1);
 
-    // 类型转换到 float
+    // 统一转换为 float 计算
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
@@ -77,7 +88,7 @@ torch::Tensor bang_func(
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {32, 1, 1};
+    cnrtDim3_t dim = {32, 1, 1};          // 32 个任务，可根据需要调整
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     gemv_kernel<<<dim, ktype, queue>>>(
