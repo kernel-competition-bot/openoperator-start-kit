@@ -15,61 +15,66 @@ __mlu_entry__ void gemv_kernel(
     uint32_t task_num = taskDim;
     uint32_t per_task = M / task_num;
     uint32_t remainder = M % task_num;
-    uint32_t start_row = task_id * per_task + (task_id < remainder ? task_id : remainder);
-    uint32_t count = per_task + (task_id < remainder ? 1 : 0);
-
-    // 使用 double 累加器（NRAM 上）
-    __nram__ double accs[1024];   // 1024 足够覆盖常见 count
-    for (uint32_t i = 0; i < count; ++i) {
-        accs[i] = 0.0;
-    }
+    uint32_t start_row = task_id * per_task +
+                         (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task +
+                     (task_id < remainder ? 1 : 0);
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
 
-    // 外层循环：K 分块
-    for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
-        uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
-
-        // 加载 B 的当前块（所有行共享）
-        __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
-
-        // 对内层所有行处理
-        for (uint32_t i = 0; i < count; ++i) {
-            uint32_t row = start_row + i;
-            __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
-
-            // 向量逐元素乘法
-            __bang_mul(nram_a, nram_a, nram_b, len);
-
-            // 手工累加，累加到 double 变量
-            double sum = accs[i];
-            for (uint32_t j = 0; j < len; ++j) {
-                sum += (double)nram_a[j];   // 显式转为 double 避免精度丢失
-            }
-            accs[i] = sum;
-        }
-    }
-
-    // 写回结果
     for (uint32_t i = 0; i < count; ++i) {
-        C[start_row + i] = (float)accs[i];  // double -> float
+        uint32_t row = start_row + i;
+        double acc = 0.0;   // 关键修改：使用 double 累加器
+
+        for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
+            uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
+            uint32_t aligned_len = (len + 63) & ~63;
+
+            // 加载 B 片段
+            __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
+            for (uint32_t j = len; j < aligned_len; ++j) {
+                nram_b[j] = 0.0f;
+            }
+
+            // 加载 A 当前行片段
+            __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
+            for (uint32_t j = len; j < aligned_len; ++j) {
+                nram_a[j] = 0.0f;
+            }
+
+            // 向量乘法
+            __bang_mul(nram_a, nram_a, nram_b, aligned_len);
+
+            // 手工累加（使用 double 临时变量）
+            double partial_sum = 0.0;
+            for (uint32_t j = 0; j < len; ++j) {
+                partial_sum += (double)nram_a[j];
+            }
+            acc += partial_sum;
+        }
+
+        // 写回结果（double -> float）
+        C[row] = (float)acc;
     }
 }
 
+// Python 入口函数名必须为 bang_func
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
 
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D [M, K]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be [K, 1]");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimension mismatch");
+    TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor [M, K]");
+    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be a 2D tensor [K, 1]");
+    TORCH_CHECK(A.size(1) == B.size(0),
+                "Inner dimensions must match: A.shape[1] == B.shape[0]");
 
     int M = A.size(0);
     int K = A.size(1);
 
+    // 类型转换到 float
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
