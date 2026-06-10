@@ -2,121 +2,136 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define NRAM_BUF_SIZE 4096   // 每次拷贝到NRAM的最大float个数
+#define CHUNK_SIZE 4096
 
-
-
-__mlu_entry__ void adaptive_max_pool_2d_kernel(
-    float *x,
+__mlu_entry__ void adaptive_max_pool2d_kernel(
+    float *input,
     float *output,
-    int batch,
-    int channels,
+    int N,
+    int C,
     int H,
     int W,
     int out_h,
-    int out_w)
-{
-    int total_elements = batch * channels * out_h * out_w;
+    int out_w) {
 
-    // 按输出元素拆分任务
-    uint32_t task_id = taskId;
-    uint32_t task_num = taskDim;
-    uint32_t per_task = total_elements / task_num;
-    uint32_t rem = total_elements % task_num;
-    uint32_t start = task_id * per_task + (task_id < rem ? task_id : rem);
-    uint32_t count = per_task + (task_id < rem ? 1 : 0);
+    // -------- 多核拆分参数 --------
+    int total = N * C * out_h * out_w;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
 
-    __nram__ float nram_buf[NRAM_BUF_SIZE];
-    const float NEG_INF = -1e38f;
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
 
-    for (uint32_t idx = 0; idx < count; ++idx) {
-        uint32_t global_idx = start + idx;
+    // 输入/输出平面大小
+    int in_plane_size = H * W;
+    int out_plane_size = out_h * out_w;
 
-        // 从输出索引反推坐标 (batch, channel, out_i, out_j)
-        uint32_t out_j = global_idx % out_w;
-        uint32_t temp = global_idx / out_w;
-        uint32_t out_i = temp % out_h;
-        temp = temp / out_h;
-        uint32_t ch = temp % channels;
-        uint32_t batch_idx = temp / channels;
+    // NRAM 缓冲区，用于加载输入的一行/部分行
+    __nram__ float buf[CHUNK_SIZE];
 
-        // 计算输入窗口范围 (左闭右开)
-        uint32_t start_h = out_i * H / out_h;
-        uint32_t end_h   = (out_i + 1) * H / out_h;
-        uint32_t start_w = out_j * W / out_w;
-        uint32_t end_w   = (out_j + 1) * W / out_w;
-        uint32_t window_w = end_w - start_w;
+    // 遍历本 core 负责的所有输出元素
+    for (uint32_t idx = start; idx < start + count; ++idx) {
+        // 将线性索引分解为 (n, c, oh, ow)
+        int tmp = idx;
+        int ow = tmp % out_w;  tmp /= out_w;
+        int oh = tmp % out_h;  tmp /= out_h;
+        int c  = tmp % C;      tmp /= C;
+        int n  = tmp;
 
-        float max_val = NEG_INF;
+        // 计算输入中对应的池化区域
+        int start_h = oh * H / out_h;
+        int end_h   = (oh + 1) * H / out_h;
+        if (((oh + 1) * H) % out_h != 0) end_h++;
+        if (end_h > H) end_h = H;
 
-        for (uint32_t in_i = start_h; in_i < end_h; ++in_i) {
-            uint32_t row_offset = ((batch_idx * channels + ch) * H + in_i) * W;
-            float row_max = NEG_INF;
+        int start_w = ow * W / out_w;
+        int end_w   = (ow + 1) * W / out_w;
+        if (((ow + 1) * W) % out_w != 0) end_w++;
+        if (end_w > W) end_w = W;
 
-            // 分块加载窗口内一行数据到NRAM，计算该行最大值
-            for (uint32_t offset_w = 0; offset_w < window_w; offset_w += NRAM_BUF_SIZE) {
-                uint32_t len = (offset_w + NRAM_BUF_SIZE <= window_w) ?
-                               NRAM_BUF_SIZE : (window_w - offset_w);
-                __memcpy(nram_buf,
-                         x + row_offset + start_w + offset_w,
-                         len * sizeof(float),
-                         GDRAM2NRAM);
+        // 初始化最大值为很小的数
+        float max_val = -3.402823e38f;
 
-                for (uint32_t k = 0; k < len; ++k) {
-                    if (nram_buf[k] > row_max) row_max = nram_buf[k];
+        // 指向当前 batch / channel 的输入基地址
+        float *in_base = input + n * C * in_plane_size + c * in_plane_size;
+
+        // 逐行求最大值
+        for (int h = start_h; h < end_h; ++h) {
+            int row_len = end_w - start_w;
+            float *row_ptr = in_base + h * W + start_w;
+
+            // 分块读取该行，避免超出 NRAM 容量
+            for (int offset = 0; offset < row_len; offset += CHUNK_SIZE) {
+                int cur_len = CHUNK_SIZE;
+                if (offset + cur_len > row_len) {
+                    cur_len = row_len - offset;
+                }
+
+                // 对齐到 64 字节 (16 floats)，便于向量化
+                int aligned_len = (cur_len + 63) & ~63;
+
+                __memcpy(
+                    buf,
+                    row_ptr + offset,
+                    cur_len * sizeof(float),
+                    GDRAM2NRAM);
+
+                // 标量循环求本块最大值，并更新全局最大值
+                for (int i = 0; i < cur_len; ++i) {
+                    if (buf[i] > max_val) {
+                        max_val = buf[i];
+                    }
                 }
             }
-
-            if (row_max > max_val) max_val = row_max;
         }
 
-        output[global_idx] = max_val;
+        // 写回输出
+        output[idx] = max_val;
     }
 }
 
-torch::Tensor bang_func(
-    torch::Tensor x,
-    int out_h,
-    int out_w)
-{
-    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
-    TORCH_CHECK(out_h > 0 && out_w > 0, "Output dimensions must be positive");
 
-    auto original_dtype = x.scalar_type();
+torch::Tensor bang_adaptive_max_pool2d(
+    torch::Tensor input,
+    int64_t out_h,
+    int64_t out_w) {
 
-    torch::Tensor x_fp32 = x;
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
+
+    auto original_dtype = input.scalar_type();
+
+    // 统一转为 float32 计算
+    torch::Tensor input_fp32 = input;
     if (original_dtype != torch::kFloat) {
-        x_fp32 = x.to(torch::kFloat);
+        input_fp32 = input.to(torch::kFloat);
     }
 
-    int batch = x_fp32.size(0);
-    int channels = x_fp32.size(1);
-    int H = x_fp32.size(2);
-    int W = x_fp32.size(3);
+    int N = input_fp32.size(0);
+    int C = input_fp32.size(1);
+    int H = input_fp32.size(2);
+    int W = input_fp32.size(3);
 
-    auto output = torch::empty(
-        {batch, channels, out_h, out_w},
-        x_fp32.options());
+    auto output_fp32 = torch::empty({N, C, out_h, out_w}, input_fp32.options());
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    // 保持原启动配置：4个core，Union1类型
+    cnrtQueue_t queue = nullptr;
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    adaptive_max_pool_2d_kernel<<<dim, ktype, queue>>>(
-        x_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        batch,
-        channels,
-        H,
-        W,
-        out_h,
-        out_w);
+    adaptive_max_pool2d_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, C, H, W,
+        (int)out_h, (int)out_w);
 
-    return output;
-}
+    // 恢复原始数据类型
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_func", &bang_func, "2D Adaptive Max Pool");
+    return output_fp32;
 }
