@@ -2,22 +2,37 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#include <cstdint>
+
 #define CHUNK_SIZE 4096
+#define CORE_NUM 4
+
+#define CNRT_CHECK_RET(expr)                                      \
+    do {                                                          \
+        cnrtRet_t ret = (expr);                                   \
+        TORCH_CHECK(ret == CNRT_RET_SUCCESS,                      \
+                    "CNRT error, ret = ", static_cast<int>(ret)); \
+    } while (0)
+
 
 __mlu_entry__ void pointwise_conv2d_kernel(
     float *x,
     float *weight,
-    float *bias,
     float *output,
     int B,
     int C,
     int H,
     int W,
     int K,
+    int H_out,
+    int W_out,
+    int padding,
+    int stride,
     int total_out) {
 
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
+
     uint32_t per_core = total_out / core_num;
     uint32_t remainder = total_out % core_num;
 
@@ -35,53 +50,72 @@ __mlu_entry__ void pointwise_conv2d_kernel(
     for (uint32_t idx = 0; idx < count; idx++) {
         uint32_t g = start + idx;
 
-        uint32_t b = g / (K * H * W);
-        uint32_t r = g % (K * H * W);
-        uint32_t k = r / (H * W);
-        uint32_t s = r % (H * W);
-        uint32_t h = s / W;
-        uint32_t w = s % W;
+        uint32_t b = g / (K * H_out * W_out);
+        uint32_t r = g % (K * H_out * W_out);
 
-        float acc = (bias != nullptr) ? bias[k] : 0.0f;
+        uint32_t k = r / (H_out * W_out);
+        uint32_t s = r % (H_out * W_out);
 
-        uint32_t x_base = b * C * H * W + h * W + w;
-        uint32_t w_base = k * C;
+        uint32_t oh = s / W_out;
+        uint32_t ow = s % W_out;
 
-        for (uint32_t c = 0; c < C; c += CHUNK_SIZE) {
-            uint32_t c_len =
-                (c + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - c);
-            uint32_t aligned_len = (c_len + 63) & ~63;
+        int ih = (int)oh * stride - padding;
+        int iw = (int)ow * stride - padding;
 
-            for (uint32_t j = 0; j < c_len; j++) {
+        float acc = 0.0f;
+
+        if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+            uint32_t x_base = b * C * H * W + ih * W + iw;
+            uint32_t w_base = k * C;
+
+            for (uint32_t c = 0; c < (uint32_t)C; c += CHUNK_SIZE) {
+                uint32_t c_len =
+                    (c + CHUNK_SIZE <= (uint32_t)C)
+                        ? CHUNK_SIZE
+                        : ((uint32_t)C - c);
+
+                uint32_t aligned_len = (c_len + 63) & ~63;
+
+                for (uint32_t j = 0; j < c_len; j++) {
+                    __memcpy(
+                        nram_x + j,
+                        x + x_base + (c + j) * H * W,
+                        sizeof(float),
+                        GDRAM2NRAM);
+                }
+
+                for (uint32_t j = c_len; j < aligned_len; j++) {
+                    nram_x[j] = 0.0f;
+                }
+
                 __memcpy(
-                    nram_x + j,
-                    x + x_base + (c + j) * H * W,
-                    sizeof(float),
+                    nram_w,
+                    weight + w_base + c,
+                    c_len * sizeof(float),
                     GDRAM2NRAM);
-            }
-            for (uint32_t j = c_len; j < aligned_len; j++) {
-                nram_x[j] = 0.0f;
-            }
 
-            __memcpy(
-                nram_w,
-                weight + w_base + c,
-                c_len * sizeof(float),
-                GDRAM2NRAM);
-            for (uint32_t j = c_len; j < aligned_len; j++) {
-                nram_w[j] = 0.0f;
-            }
+                for (uint32_t j = c_len; j < aligned_len; j++) {
+                    nram_w[j] = 0.0f;
+                }
 
-            __bang_mul(nram_mul, nram_x, nram_w, aligned_len);
+                __bang_mul(
+                    nram_mul,
+                    nram_x,
+                    nram_w,
+                    aligned_len);
 
-            for (uint32_t j = 0; j < c_len; j++) {
-                acc += nram_mul[j];
+                for (uint32_t j = 0; j < c_len; j++) {
+                    acc += nram_mul[j];
+                }
             }
         }
 
         nram_scalar[0] = acc;
+
         __memcpy(
-            output + b * K * H * W + k * H * W + h * W + w,
+            output + b * K * H_out * W_out +
+                     k * H_out * W_out +
+                     oh * W_out + ow,
             nram_scalar,
             sizeof(float),
             NRAM2GDRAM);
@@ -92,74 +126,108 @@ __mlu_entry__ void pointwise_conv2d_kernel(
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor weight,
-    c10::optional<torch::Tensor> bias = c10::nullopt) {
+    int padding,
+    int stride,
+    bool has_bias) {
+
+    TORCH_CHECK(
+        x.dim() == 4,
+        "x must be a 4D tensor with shape [B, C, H, W]");
+
+    TORCH_CHECK(
+        weight.dim() == 4,
+        "weight must be a 4D tensor with shape [K, C, 1, 1]");
 
     TORCH_CHECK(
         x.is_contiguous(),
         "x must be contiguous");
+
     TORCH_CHECK(
         weight.is_contiguous(),
         "weight must be contiguous");
 
-    int B = x.size(0);
-    int C = x.size(1);
-    int H = x.size(2);
-    int W = x.size(3);
-    int K = weight.size(0);
+    TORCH_CHECK(
+        x.device() == weight.device(),
+        "x and weight must be on the same device");
+
+    int B = static_cast<int>(x.size(0));
+    int C = static_cast<int>(x.size(1));
+    int H = static_cast<int>(x.size(2));
+    int W = static_cast<int>(x.size(3));
+    int K = static_cast<int>(weight.size(0));
+
+    TORCH_CHECK(
+        B > 0 && C > 0 && H > 0 && W > 0 && K > 0,
+        "B, C, H, W, K must all be positive");
 
     TORCH_CHECK(
         weight.size(1) == C,
         "weight in_channels must match x");
+
     TORCH_CHECK(
         weight.size(2) == 1 && weight.size(3) == 1,
         "weight must be 1x1 kernel");
+
+    TORCH_CHECK(
+        padding >= 0,
+        "padding must be non-negative");
+
+    TORCH_CHECK(
+        stride > 0,
+        "stride must be positive");
+
+    int H_out = (H + 2 * padding - 1) / stride + 1;
+    int W_out = (W + 2 * padding - 1) / stride + 1;
+
+    TORCH_CHECK(
+        H_out > 0 && W_out > 0,
+        "invalid output shape");
 
     auto original_dtype = x.scalar_type();
 
     torch::Tensor x_fp32 = x;
     torch::Tensor w_fp32 = weight;
-    bool has_bias = bias.has_value();
 
-    if (original_dtype != torch::kFloat) {
+    if (x.scalar_type() != torch::kFloat) {
         x_fp32 = x.to(torch::kFloat);
+    }
+
+    if (weight.scalar_type() != torch::kFloat) {
         w_fp32 = weight.to(torch::kFloat);
     }
 
-    torch::Tensor b_fp32;
-    if (has_bias) {
-        b_fp32 = bias.value();
-        if (b_fp32.scalar_type() != torch::kFloat) {
-            b_fp32 = b_fp32.to(torch::kFloat);
-        }
-        TORCH_CHECK(
-            b_fp32.is_contiguous(),
-            "bias must be contiguous");
-        TORCH_CHECK(
-            b_fp32.size(0) == K,
-            "bias size must match out_channels");
-    }
+    x_fp32 = x_fp32.contiguous();
+    w_fp32 = w_fp32.contiguous();
 
     auto output_fp32 = torch::empty(
-        {B, K, H, W},
+        {B, K, H_out, W_out},
         torch::TensorOptions()
             .dtype(torch::kFloat)
             .device(x_fp32.device()));
 
-    int total_out = B * K * H * W;
+    int total_out = B * K * H_out * W_out;
 
     cnrtQueue_t queue = nullptr;
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    float *bias_ptr = has_bias ? b_fp32.data_ptr<float>() : nullptr;
+    cnrtDim3_t dim = {CORE_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     pointwise_conv2d_kernel<<<dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
         w_fp32.data_ptr<float>(),
-        bias_ptr,
         output_fp32.data_ptr<float>(),
-        B, C, H, W, K,
+        B,
+        C,
+        H,
+        W,
+        K,
+        H_out,
+        W_out,
+        padding,
+        stride,
         total_out);
+
+    CNRT_CHECK_RET(cnrtQueueSync(queue));
 
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
