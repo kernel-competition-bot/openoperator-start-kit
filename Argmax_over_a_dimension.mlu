@@ -6,6 +6,7 @@
 #define CHUNK_SIZE 4096
 #define CORE_NUM 4                     // MLU370 常用核心数
 
+
 __mlu_entry__ void argmax_kernel(
     float *input,
     int64_t *output,

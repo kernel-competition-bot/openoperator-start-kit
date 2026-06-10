@@ -4,6 +4,7 @@
 
 #define CHUNK_SIZE 4096
 
+
 __mlu_entry__ void cos_kernel(
     float *input,
     float *output,

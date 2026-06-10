@@ -4,6 +4,7 @@
 
 #define NRAM_BUF_SIZE 65536
 
+
 __mlu_entry__ void gemv_kernel(
     float* A,
     float* B,
