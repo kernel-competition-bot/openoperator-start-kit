@@ -3,8 +3,8 @@
 #include <torch/extension.h>
 #include <torch_mlu/csrc/aten/utils/cnnl_util.h>
 
-const int NRAM_SIZE = 1024 * 128;
-const int NRAM_FLOAT_CAP = NRAM_SIZE / sizeof(float);
+#define NRAM_SIZE (1024 * 128)
+#define MAX_DEAL (NRAM_SIZE / sizeof(float) / 3 / 64 * 64)
 
 __mlu_entry__ void leaky_relu_kernel(float *input, float *output, int num_elements, float negative_slope) {
     int per_task = num_elements / taskDim;
@@ -13,19 +13,15 @@ __mlu_entry__ void leaky_relu_kernel(float *input, float *output, int num_elemen
     int len = per_task + (taskId < remainder ? 1 : 0);
     if (len <= 0) return;
 
-    // 3 buffers: src, scaled, mask
-    int max_deal = NRAM_FLOAT_CAP / 3;
-    max_deal = max_deal / 64 * 64;
-
-    __nram__ float nram_src[NRAM_FLOAT_CAP / 3];
-    __nram__ float nram_scaled[NRAM_FLOAT_CAP / 3];
-    __nram__ float nram_mask[NRAM_FLOAT_CAP / 3];
+    __nram__ float nram_src[MAX_DEAL];
+    __nram__ float nram_scaled[MAX_DEAL];
+    __nram__ float nram_mask[MAX_DEAL];
 
     int offset = start;
     int remain = len;
 
     while (remain > 0) {
-        int deal_num = remain > max_deal ? max_deal : remain;
+        int deal_num = remain > (int)MAX_DEAL ? (int)MAX_DEAL : remain;
         int align_num = (deal_num + 63) / 64 * 64;
 
         __memcpy(nram_src, input + offset, deal_num * sizeof(float), GDRAM2NRAM);
@@ -34,13 +30,21 @@ __mlu_entry__ void leaky_relu_kernel(float *input, float *output, int num_elemen
         __bang_mul_scalar(nram_scaled, nram_src, negative_slope, align_num);
 
         // mask = (x >= 0) ? 1.0 : 0.0
-        __bang_ge_scalar(nram_mask, nram_src, 0.0f, align_num);
+        __bang_active_relu(nram_mask, nram_src, align_num);
+        __bang_gt_scalar(nram_mask, nram_mask, 0.0f, align_num);
+        // For x > 0: relu(x) > 0 -> mask=1; for x <= 0: relu(x)=0 -> mask=0
+        // But x==0 should give mask=1. Use different approach:
 
-        // result = mask * x + (1 - mask) * scaled
+        // mask: x >= 0 -> 1, x < 0 -> 0
+        // Use: mask = (x + |x|) / (2*x) won't work for x=0
+        // Better: use bang_ge_scalar if available, otherwise:
+        __bang_write_zero(nram_mask, align_num);
+        __bang_ge_scalar(nram_mask, nram_src, (float)0, align_num);
+
         // nram_src = mask * x
         __bang_mul(nram_src, nram_src, nram_mask, align_num);
 
-        // nram_mask = 1 - mask (invert)
+        // nram_mask = 1 - mask
         __bang_mul_scalar(nram_mask, nram_mask, -1.0f, align_num);
         __bang_add_scalar(nram_mask, nram_mask, 1.0f, align_num);
 
