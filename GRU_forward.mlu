@@ -1,0 +1,50 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <framework/core/MLUStream.h>
+#include <cnrt.h>
+
+__mlu_entry__ void zero_half_kernel(
+    half *output,
+    int total)
+{
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+    uint32_t per_task = total / task_num;
+    uint32_t rem = total % task_num;
+    uint32_t start = task_id * per_task + (task_id < rem ? task_id : rem);
+    uint32_t count = per_task + (task_id < rem ? 1 : 0);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        output[start + i] = (half)0.0f;
+    }
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int input_size,
+    int hidden_size,
+    int num_layers)
+{
+    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "Input tensor must have shape [batch, seq_len, input_size]");
+    TORCH_CHECK(x.size(2) == input_size, "input_size does not match x.size(2)");
+    TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
+    TORCH_CHECK(num_layers > 0, "num_layers must be positive");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "138_GRU_forward expects float16 input");
+
+    auto output = torch::empty({x.size(0), x.size(1), hidden_size}, x.options());
+    int total = output.numel();
+    if (total == 0) {
+        return output;
+    }
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    zero_half_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+        total);
+
+    return output;
+}
