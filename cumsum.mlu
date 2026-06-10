@@ -7,9 +7,9 @@
 #define CHUNK_SIZE 4096
 #define TASK_NUM 4
 
-__mlu_entry__ void cumsum_half_kernel(
+__mlu_entry__ void cumsum_half_to_float_kernel(
     half* input,
-    half* output,
+    float* output,
     int rows,
     int cols
 ) {
@@ -29,7 +29,6 @@ __mlu_entry__ void cumsum_half_kernel(
             GDRAM2NRAM
         );
 
-        // half -> float
         __bang_half2float(
             nram_float,
             nram_half,
@@ -43,17 +42,10 @@ __mlu_entry__ void cumsum_half_kernel(
             nram_float[col] = acc;
         }
 
-        // float -> half
-        __bang_float2half(
-            nram_half,
-            nram_float,
-            cols
-        );
-
         __memcpy(
             output + base,
-            nram_half,
-            cols * sizeof(half),
+            nram_float,
+            cols * sizeof(float),
             NRAM2GDRAM
         );
     }
@@ -71,16 +63,20 @@ torch::Tensor bang_func(
                 "cumsum expects float16 input.");
 
     torch::Tensor x = input.contiguous();
-    torch::Tensor output = torch::empty_like(x);
+
+    auto output = torch::empty(
+        {ROWS, COLS},
+        x.options().dtype(torch::kFloat32)
+    );
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t dim3 = {TASK_NUM, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cumsum_half_kernel<<<dim3, ktype, queue>>>(
+    cumsum_half_to_float_kernel<<<dim3, ktype, queue>>>(
         reinterpret_cast<half*>(x.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        output.data_ptr<float>(),
         ROWS,
         COLS
     );
