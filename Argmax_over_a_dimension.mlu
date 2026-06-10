@@ -1,111 +1,115 @@
 #include <bang.h>
-#include <float.h>                     // 提供 FLT_MAX
 #include <torch/extension.h>
 #include <cnrt.h>
-
-#define CHUNK_SIZE 4096
-#define CORE_NUM 4                     // MLU370 常用核心数
-
-
+#include <cfloat.h>   // for FLT_MAX
 
 __mlu_entry__ void argmax_kernel(
-    float *input,
-    int64_t *output,
-    int reduce_size,
-    int inner_size,
-    int total_outputs) {
+    float *x,
+    int64_t *indices,
+    int total_out,
+    int dim_size,
+    int ndim,
+    int dim,
+    int *shape_g,
+    int *stride_g) {
 
-    // 多核拆分参数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total_outputs / core_num;
-    uint32_t remainder = total_outputs % core_num;
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
 
-    uint32_t start = core_id * per_core +
-                     (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core +
-                     (core_id < remainder ? 1 : 0);
+    uint32_t per_task = total_out / task_num;
+    uint32_t remainder = total_out % task_num;
+    uint32_t start = task_id * per_task +
+                     (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task +
+                     (task_id < remainder ? 1 : 0);
 
-    // NRAM（格式要求，本例中未实际使用）
-    __nram__ float nram_input[CHUNK_SIZE];
-    __nram__ float nram_relu[CHUNK_SIZE];
-    __nram__ float nram_temp[CHUNK_SIZE];
+    // 将 shape 和 stride 加载到 NRAM
+    __nram__ int shape[8];
+    __nram__ int stride[8];
+    __memcpy(shape, shape_g, ndim * sizeof(int), GDRAM2NRAM);
+    __memcpy(stride, stride_g, ndim * sizeof(int), GDRAM2NRAM);
 
-    // 外层分块：按输出元素分块，保持与 leakyrelu 相同的循环结构
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t block_len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+    // 每个任务处理一段输出元素
+    for (uint32_t out_idx = start; out_idx < start + count; ++out_idx) {
 
-        for (uint32_t j = 0; j < block_len; ++j) {
-            uint32_t output_idx = start + offset + j;
-            uint32_t outer_idx = output_idx / inner_size;
-            uint32_t inner_idx = output_idx % inner_size;
+        // 将输出线性索引转换为输入（去掉 dim 维度）的基地址
+        int remaining = out_idx;
+        int base_offset = 0;
 
-            // 第 outer_idx 个 outer 块中的起始偏移（单位：float）
-            uint32_t base_offset = (outer_idx * reduce_size * inner_size + inner_idx);
-            int stride = inner_size;          // 步长（元素个数）
-
-            float best_val = -FLT_MAX;
-            int64_t best_idx = 0;
-
-            // 线性扫描规约维度（保持原算法不变）
-            for (int k = 0; k < reduce_size; ++k) {
-                float val = input[base_offset + k * stride];
-                if (val > best_val) {
-                    best_val = val;
-                    best_idx = k;
-                }
-            }
-            output[output_idx] = best_idx;
+        // 从最内层维度开始解析多维坐标（跳过 dim）
+        for (int j = ndim - 1; j >= 0; --j) {
+            if (j == dim) continue;
+            int size_j = shape[j];
+            int coord_j = remaining % size_j;
+            remaining /= size_j;
+            base_offset += coord_j * stride[j];
         }
+
+        // 沿 dim 维度寻找最大值及索引
+        float max_val = -FLT_MAX;
+        int64_t max_idx = 0;
+
+        // 标量逐元素访问（因为 stride[dim] 不一定为 1，无法连续加载）
+        for (int i = 0; i < dim_size; ++i) {
+            float val = x[base_offset + i * stride[dim]];
+            if (val > max_val) {
+                max_val = val;
+                max_idx = i;
+            }
+        }
+
+        indices[out_idx] = max_idx;
     }
 }
 
-torch::Tensor bang_func(
+
+torch::Tensor argmax_mlu(
     torch::Tensor x,
     int64_t dim) {
 
-    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
-    TORCH_CHECK(dim >= 0 && dim < x.dim(), "dim out of range");
+    // 归一化 dim
+    int64_t ndim = x.dim();
+    if (dim < 0) dim += ndim;
+    TORCH_CHECK(dim >= 0 && dim < ndim, "dim out of range");
 
-    // 保留原始 dtype，并将输入转为 float 类型
+    // 转换为 float 进行计算（保持原始类型用于输出判断，但输出是 long）
+    auto original_dtype = x.scalar_type();
     torch::Tensor x_fp32 = x;
-    if (x.scalar_type() != torch::kFloat) {
+    if (original_dtype != torch::kFloat) {
         x_fp32 = x.to(torch::kFloat);
     }
 
-    // 输出形状：去掉 dim 维度
-    auto sizes = x_fp32.sizes().vec();
-    sizes.erase(sizes.begin() + dim);
-    auto output = torch::empty(
-        sizes,
-        torch::TensorOptions()
-            .dtype(torch::kLong)        // int64
-            .device(x_fp32.device()));
+    // 确保连续性（便于地址计算）
+    x_fp32 = x_fp32.contiguous();
 
-    // 计算 outer_size, reduce_size, inner_size
-    int64_t reduce_size = x_fp32.size(dim);
-    int64_t inner_size = 1;
-    for (size_t i = dim + 1; i < (size_t)x_fp32.dim(); ++i) {
-        inner_size *= x_fp32.size(i);
+    // 输出形状：移除 dim 维度
+    std::vector<int64_t> out_shape;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i != dim) out_shape.push_back(x.size(i));
     }
-    int64_t outer_size = 1;
-    for (int64_t i = 0; i < dim; ++i) {
-        outer_size *= x_fp32.size(i);
-    }
-    int64_t total_outputs = outer_size * inner_size;
-    TORCH_CHECK(total_outputs == output.numel(), "Output size mismatch");
+    auto indices = torch::empty(out_shape, torch::dtype(torch::kLong).device(x.device()));
 
-    // 获取 MLU 队列并启动 kernel
+    int total_out = indices.numel();
+    int dim_size = x_fp32.size(dim);
+
+    // 将 shape 和 stride 放入 MLU 全局内存，以便 kernel 访问
+    auto shape_tensor = torch::tensor(x_fp32.sizes(), torch::kInt32).to(x.device());
+    auto stride_tensor = torch::tensor(x_fp32.strides(), torch::kInt32).to(x.device());
+
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim_grid = {CORE_NUM, 1, 1};
+    cnrtDim3_t dim3 = {32, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    argmax_kernel<<<dim_grid, ktype, queue>>>(
+    argmax_kernel<<<dim3, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
-        output.data_ptr<int64_t>(),
-        reduce_size,
-        inner_size,
-        total_outputs);
+        indices.data_ptr<int64_t>(),
+        total_out,
+        dim_size,
+        static_cast<int>(ndim),
+        static_cast<int>(dim),
+        shape_tensor.data_ptr<int>(),
+        stride_tensor.data_ptr<int>()
+    );
 
-    return output;
+    return indices;
 }
