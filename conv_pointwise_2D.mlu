@@ -2,6 +2,8 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#include "framework/core/MLUStream.h"
+
 #include <cstdint>
 
 #define CHUNK_SIZE 4096
@@ -24,17 +26,15 @@ __mlu_entry__ void pointwise_conv2d_kernel(
     int H,
     int W,
     int K,
-    int H_out,
-    int W_out,
-    int padding,
-    int stride,
-    int total_out) {
+    int spatial,
+    int tile_num,
+    int total_units) {
 
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    uint32_t per_core = total_out / core_num;
-    uint32_t remainder = total_out % core_num;
+    uint32_t per_core = total_units / core_num;
+    uint32_t remainder = total_units % core_num;
 
     uint32_t start = core_id * per_core +
                      (core_id < remainder ? core_id : remainder);
@@ -45,79 +45,70 @@ __mlu_entry__ void pointwise_conv2d_kernel(
     __nram__ float nram_x[CHUNK_SIZE];
     __nram__ float nram_w[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_scalar[1];
+    __nram__ float nram_acc[CHUNK_SIZE];
 
     for (uint32_t idx = 0; idx < count; idx++) {
-        uint32_t g = start + idx;
+        uint32_t unit = start + idx;
 
-        uint32_t b = g / (K * H_out * W_out);
-        uint32_t r = g % (K * H_out * W_out);
+        uint32_t pair_id = unit / tile_num;
+        uint32_t tile_id = unit % tile_num;
 
-        uint32_t k = r / (H_out * W_out);
-        uint32_t s = r % (H_out * W_out);
+        uint32_t b = pair_id / K;
+        uint32_t k = pair_id % K;
 
-        uint32_t oh = s / W_out;
-        uint32_t ow = s % W_out;
+        uint32_t s0 = tile_id * CHUNK_SIZE;
 
-        int ih = (int)oh * stride - padding;
-        int iw = (int)ow * stride - padding;
+        uint32_t len =
+            (s0 + CHUNK_SIZE <= (uint32_t)spatial)
+                ? CHUNK_SIZE
+                : ((uint32_t)spatial - s0);
 
-        float acc = 0.0f;
+        uint32_t aligned_len = (len + 63) & ~63;
 
-        if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-            uint32_t x_base = b * C * H * W + ih * W + iw;
-            uint32_t w_base = k * C;
-
-            for (uint32_t c = 0; c < (uint32_t)C; c += CHUNK_SIZE) {
-                uint32_t c_len =
-                    (c + CHUNK_SIZE <= (uint32_t)C)
-                        ? CHUNK_SIZE
-                        : ((uint32_t)C - c);
-
-                uint32_t aligned_len = (c_len + 63) & ~63;
-
-                for (uint32_t j = 0; j < c_len; j++) {
-                    __memcpy(
-                        nram_x + j,
-                        x + x_base + (c + j) * H * W,
-                        sizeof(float),
-                        GDRAM2NRAM);
-                }
-
-                for (uint32_t j = c_len; j < aligned_len; j++) {
-                    nram_x[j] = 0.0f;
-                }
-
-                __memcpy(
-                    nram_w,
-                    weight + w_base + c,
-                    c_len * sizeof(float),
-                    GDRAM2NRAM);
-
-                for (uint32_t j = c_len; j < aligned_len; j++) {
-                    nram_w[j] = 0.0f;
-                }
-
-                __bang_mul(
-                    nram_mul,
-                    nram_x,
-                    nram_w,
-                    aligned_len);
-
-                for (uint32_t j = 0; j < c_len; j++) {
-                    acc += nram_mul[j];
-                }
-            }
+        for (uint32_t j = 0; j < aligned_len; j++) {
+            nram_acc[j] = 0.0f;
         }
 
-        nram_scalar[0] = acc;
+        for (uint32_t c = 0; c < (uint32_t)C; c++) {
+            float *x_ptr =
+                x + (((uint32_t)b * C + c) * spatial + s0);
+
+            __memcpy(
+                nram_x,
+                x_ptr,
+                len * sizeof(float),
+                GDRAM2NRAM);
+
+            for (uint32_t j = len; j < aligned_len; j++) {
+                nram_x[j] = 0.0f;
+            }
+
+            float w_value = weight[k * C + c];
+
+            for (uint32_t j = 0; j < aligned_len; j++) {
+                nram_w[j] = w_value;
+            }
+
+            __bang_mul(
+                nram_mul,
+                nram_x,
+                nram_w,
+                aligned_len);
+
+            __bang_add(
+                nram_acc,
+                nram_acc,
+                nram_mul,
+                aligned_len);
+        }
+
+        float *out_ptr =
+            output + (((uint32_t)b * K + k) * spatial + s0);
 
         __memcpy(
-            output + b * K * H_out * W_out +
-                     k * H_out * W_out +
-                     oh * W_out + ow,
-            nram_scalar,
-            sizeof(float),
+            out_ptr,
+            nram_acc,
+            len * sizeof(float),
             NRAM2GDRAM);
     }
 }
@@ -168,21 +159,6 @@ torch::Tensor bang_func(
         weight.size(2) == 1 && weight.size(3) == 1,
         "weight must be 1x1 kernel");
 
-    TORCH_CHECK(
-        padding >= 0,
-        "padding must be non-negative");
-
-    TORCH_CHECK(
-        stride > 0,
-        "stride must be positive");
-
-    int H_out = (H + 2 * padding - 1) / stride + 1;
-    int W_out = (W + 2 * padding - 1) / stride + 1;
-
-    TORCH_CHECK(
-        H_out > 0 && W_out > 0,
-        "invalid output shape");
-
     auto original_dtype = x.scalar_type();
 
     torch::Tensor x_fp32 = x;
@@ -199,15 +175,17 @@ torch::Tensor bang_func(
     x_fp32 = x_fp32.contiguous();
     w_fp32 = w_fp32.contiguous();
 
+    int spatial = H * W;
+    int tile_num = (spatial + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int total_units = B * K * tile_num;
+
     auto output_fp32 = torch::empty(
-        {B, K, H_out, W_out},
+        {B, K, H, W},
         torch::TensorOptions()
             .dtype(torch::kFloat)
             .device(x_fp32.device()));
 
-    int total_out = B * K * H_out * W_out;
-
-    cnrtQueue_t queue = nullptr;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t dim = {CORE_NUM, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
@@ -221,11 +199,9 @@ torch::Tensor bang_func(
         H,
         W,
         K,
-        H_out,
-        W_out,
-        padding,
-        stride,
-        total_out);
+        spatial,
+        tile_num,
+        total_units);
 
     CNRT_CHECK_RET(cnrtQueueSync(queue));
 
