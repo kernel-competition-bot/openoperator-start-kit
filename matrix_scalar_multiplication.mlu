@@ -2,14 +2,13 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// 最大化 NRAM 利用：双缓冲，每个 buffer 32KB / 4B = 8192 floats
 #define CHUNK_SIZE 8192
 
-__mlu_entry__ void leakyrelu_kernel(
+__mlu_entry__ void matrix_scalar_mul_kernel(
     float *input,
     float *output,
     int total,
-    float negative_slope) {
+    float scalar) {
 
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
@@ -21,15 +20,12 @@ __mlu_entry__ void leakyrelu_kernel(
     uint32_t count = per_core +
                      (core_id < remainder ? 1 : 0);
 
-    // 双缓冲：计算与 DMA 重叠
     __nram__ float buf_in[2][CHUNK_SIZE];
     __nram__ float buf_out[CHUNK_SIZE];
-    __nram__ float buf_tmp[CHUNK_SIZE];
 
     uint32_t num_chunks = (count + CHUNK_SIZE - 1) / CHUNK_SIZE;
     int cur = 0;
 
-    // prefetch 第一块
     if (num_chunks > 0) {
         uint32_t len0 = (count < CHUNK_SIZE) ? count : CHUNK_SIZE;
         __memcpy_async(buf_in[0], input + start,
@@ -42,10 +38,8 @@ __mlu_entry__ void leakyrelu_kernel(
                            ? CHUNK_SIZE : (count - offset);
         uint32_t aligned_len = (len + 63) & ~63;
 
-        // 等待当前块 DMA 完成
         __sync_move();
 
-        // prefetch 下一块（与计算重叠）
         if (i + 1 < num_chunks) {
             uint32_t next_offset = (i + 1) * CHUNK_SIZE;
             uint32_t next_len = (next_offset + CHUNK_SIZE <= count)
@@ -55,61 +49,44 @@ __mlu_entry__ void leakyrelu_kernel(
                            next_len * sizeof(float), GDRAM2NRAM);
         }
 
-        // 计算 LeakyReLU：融合运算
-        // relu(x)
-        __bang_active_relu(buf_out, buf_in[cur], aligned_len);
-        // min(0,x) = x - relu(x)
-        __bang_sub(buf_tmp, buf_in[cur], buf_out, aligned_len);
-        // negative_slope * min(0,x) + relu(x) => 用 mul_scalar + add 融合
-        __bang_mul_scalar(buf_tmp, buf_tmp, negative_slope, aligned_len);
-        __bang_add(buf_out, buf_out, buf_tmp, aligned_len);
+        __bang_mul_scalar(buf_out, buf_in[cur], scalar, aligned_len);
 
-        // 写回（异步）
         __memcpy_async(output + start + offset, buf_out,
                        len * sizeof(float), NRAM2GDRAM);
 
         cur = 1 - cur;
     }
-    // 等待最后一次写回完成
     __sync_move();
 }
 
 
-torch::Tensor bang_func(
-    torch::Tensor input,
-    double negative_slope) {
+torch::Tensor bang_func(torch::Tensor A, double s) {
+    TORCH_CHECK(A.is_contiguous(), "Input must be contiguous");
 
-    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    auto original_dtype = A.scalar_type();
 
-    auto original_dtype = input.scalar_type();
-
-    torch::Tensor input_fp32 = input;
+    torch::Tensor A_fp32 = A;
     if (original_dtype != torch::kFloat) {
-        input_fp32 = input.to(torch::kFloat);
+        A_fp32 = A.to(torch::kFloat);
     }
 
-    auto output_fp32 = torch::empty_like(input_fp32);
-    int total = input_fp32.numel();
+    auto output = torch::empty_like(A_fp32);
+    int total = A_fp32.numel();
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 激进并行：使用 Union8（32核）最大化多核利用
     cnrtDim3_t dim = {32, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
 
-    leakyrelu_kernel<<<dim, ktype, queue>>>(
-        input_fp32.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
+    matrix_scalar_mul_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        output.data_ptr<float>(),
         total,
-        (float)negative_slope
+        (float)s
     );
 
     if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
+        return output.to(original_dtype);
     }
-    return output_fp32;
-<<<<<<< HEAD
+    return output;
 }
-=======
-}
->>>>>>> 12714b2 (sadasdasd)
