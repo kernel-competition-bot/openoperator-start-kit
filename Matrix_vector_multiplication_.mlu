@@ -20,33 +20,30 @@ __mlu_entry__ void gemv_kernel(
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
-    __nram__ float sum_float;      // 存储硬件规约结果
+    __nram__ float sum_buffer[16];  // 用于规约的缓冲区，保证对齐
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t row = start_row + i;
-        double acc = 0.0;          // double 累加器，保证精度
+        float acc = 0.0f;
 
         for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
             uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
-            uint32_t aligned_len = (len + 63) & ~63;   // 对齐到64的倍数，规约指令要求
+            uint32_t aligned_len = (len + 63) & ~63;
+            if (aligned_len == 0) continue;  // 安全性
 
-            // 加载 B 片段
             __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
             for (uint32_t j = len; j < aligned_len; ++j) nram_b[j] = 0.0f;
 
-            // 加载 A 当前行片段
             __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
             for (uint32_t j = len; j < aligned_len; ++j) nram_a[j] = 0.0f;
 
-            // 向量乘法
             __bang_mul(nram_a, nram_a, nram_b, aligned_len);
 
-            // 硬件规约求和 (sum_float 获得 float 结果)
-            __bang_reduce_sum(&sum_float, nram_a, aligned_len);
-            acc += (double)sum_float;   // 累加到 double
+            // 硬件规约，结果存入 sum_buffer[0]
+            __bang_reduce_sum(sum_buffer, nram_a, aligned_len);
+            acc += sum_buffer[0];
         }
-
-        C[row] = (float)acc;   // 写回 float
+        C[row] = acc;
     }
 }
 
@@ -56,8 +53,8 @@ torch::Tensor bang_func(
 
     TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
-    TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor [M, K]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be a 2D tensor [K, 1]");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D [M, K]");
+    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be [K, 1]");
     TORCH_CHECK(A.size(1) == B.size(0), "Inner dimensions must match");
 
     int M = A.size(0);
