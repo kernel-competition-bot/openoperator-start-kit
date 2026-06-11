@@ -2,90 +2,200 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_K 1024       // K 维度分块大小
-#define TILE_M 16          // 每个任务同时计算16行
-#define ALIGN 64           // 对齐要求
+#define CHUNK_SIZE 4096
 
-// GEMV 核心 kernel
 __mlu_entry__ void gemv_kernel(
-    float* A,
-    float* B,
-    float* C,
+    float *A,
+    float *B,
+    float *C,
     int M,
-    int K
-) {
+    int K) {
+
     uint32_t task_id = taskId;
     uint32_t task_num = taskDim;
-    uint32_t per_task = (M + task_num - 1) / task_num;
-    uint32_t start_row = task_id * per_task;
-    uint32_t end_row = start_row + per_task;
-    if (end_row > M) end_row = M;
 
-    // NRAM buffers
-    __nram__ float nram_a[TILE_M][CHUNK_K];  // tile A
-    __nram__ float nram_b[CHUNK_K];          // tile B
-    __nram__ float acc[TILE_M];              // tile acc
+    uint32_t per_task = M / task_num;
+    uint32_t remainder = M % task_num;
 
-    for (uint32_t row_tile = start_row; row_tile < end_row; row_tile += TILE_M) {
-        uint32_t rows = (row_tile + TILE_M <= end_row) ? TILE_M : (end_row - row_tile);
+    uint32_t start_row =
+        task_id * per_task +
+        (task_id < remainder ? task_id : remainder);
 
-        // 初始化累加器
-        for (uint32_t i = 0; i < rows; ++i) acc[i] = 0.0f;
+    uint32_t count =
+        per_task +
+        (task_id < remainder ? 1 : 0);
 
-        for (uint32_t k_offset = 0; k_offset < K; k_offset += CHUNK_K) {
-            uint32_t len = (k_offset + CHUNK_K <= K) ? CHUNK_K : (K - k_offset);
-            uint32_t aligned_len = (len + ALIGN - 1) & ~(ALIGN - 1);
+    __nram__ float nram_a[CHUNK_SIZE];
+    __nram__ float nram_b[CHUNK_SIZE];
 
-            // 1. 加载 B 块一次
-            __memcpy(nram_b, B + k_offset, len * sizeof(float), GDRAM2NRAM);
-            for (uint32_t j = len; j < aligned_len; ++j) nram_b[j] = 0.0f;
+    for (uint32_t row_idx = 0; row_idx < count; ++row_idx) {
 
-            // 2. 对当前 tile 的每一行加载 A 块并计算
-            for (uint32_t r = 0; r < rows; ++r) {
-                uint32_t row = row_tile + r;
-                __memcpy(nram_a[r], A + row * K + k_offset, len * sizeof(float), GDRAM2NRAM);
-                for (uint32_t j = len; j < aligned_len; ++j) nram_a[r][j] = 0.0f;
+        uint32_t row = start_row + row_idx;
 
-                // 3. 向量乘
-                __bang_mul(nram_a[r], nram_a[r], nram_b, aligned_len);
+        float acc = 0.0f;
+        float comp = 0.0f;
 
-                // 4. 向量化累加
-                float partial_sum = __bang_reduce_add(nram_a[r], aligned_len);
+        for (uint32_t offset = 0;
+             offset < K;
+             offset += CHUNK_SIZE) {
 
-                // 5. 累加到全局累加器
-                acc[r] += partial_sum;
+            uint32_t len =
+                (offset + CHUNK_SIZE <= K)
+                ? CHUNK_SIZE
+                : (K - offset);
+
+            uint32_t aligned_len =
+                (len + 63) & ~63;
+
+            // Load B chunk
+            __memcpy(
+                nram_b,
+                B + offset,
+                len * sizeof(float),
+                GDRAM2NRAM);
+
+            // Padding
+            for (uint32_t j = len;
+                 j < aligned_len;
+                 ++j) {
+                nram_b[j] = 0.0f;
             }
+
+            // Load A chunk
+            __memcpy(
+                nram_a,
+                A + row * K + offset,
+                len * sizeof(float),
+                GDRAM2NRAM);
+
+            for (uint32_t j = len;
+                 j < aligned_len;
+                 ++j) {
+                nram_a[j] = 0.0f;
+            }
+
+            // Vector multiply
+            __bang_mul(
+                nram_a,
+                nram_a,
+                nram_b,
+                aligned_len);
+
+            // Kahan reduction
+            float partial_sum = 0.0f;
+            float partial_comp = 0.0f;
+
+            for (uint32_t j = 0;
+                 j < len;
+                 ++j) {
+
+                float y =
+                    nram_a[j] -
+                    partial_comp;
+
+                float t =
+                    partial_sum +
+                    y;
+
+                partial_comp =
+                    (t - partial_sum) - y;
+
+                partial_sum = t;
+            }
+
+            // Merge block sum
+            float y =
+                partial_sum -
+                comp;
+
+            float t =
+                acc +
+                y;
+
+            comp =
+                (t - acc) - y;
+
+            acc = t;
         }
 
-        // 写回 C
-        for (uint32_t r = 0; r < rows; ++r) {
-            uint32_t row = row_tile + r;
-            C[row] = acc[r];
-        }
+        C[row] = acc;
     }
 }
 
-// Python 入口
-torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.dim() == 2, "A must be [M,K]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be [K,1]");
-    TORCH_CHECK(A.size(1) == B.size(0), "Inner dim mismatch");
+torch::Tensor bang_func(
+    torch::Tensor A,
+    torch::Tensor B) {
 
-    auto A_fp32 = A.contiguous().to(torch::kFloat);
-    auto B_fp32 = B.contiguous().to(torch::kFloat);
-    int M = A.size(0), K = A.size(1);
+    TORCH_CHECK(
+        A.is_contiguous(),
+        "A must be contiguous");
 
-    auto C = torch::empty({M,1}, A_fp32.options());
+    TORCH_CHECK(
+        B.is_contiguous(),
+        "B must be contiguous");
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {32,1,1};  // 可根据芯片调整
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    TORCH_CHECK(
+        A.dim() == 2,
+        "A must be [M,K]");
 
-    gemv_kernel<<<dim, ktype, queue>>>(A_fp32.data_ptr<float>(),
-                                       B_fp32.data_ptr<float>(),
-                                       C.data_ptr<float>(),
-                                       M, K);
+    TORCH_CHECK(
+        B.dim() == 2 &&
+        B.size(1) == 1,
+        "B must be [K,1]");
 
-    torch_mlu::syncStream(queue);
-    return C.to(A.scalar_type());
+    TORCH_CHECK(
+        A.size(1) == B.size(0),
+        "Shape mismatch");
+
+    int M = A.size(0);
+    int K = A.size(1);
+
+    auto original_dtype =
+        A.scalar_type();
+
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+        B_fp32 = B.to(torch::kFloat);
+    }
+
+    auto C_fp32 =
+        torch::empty(
+            {M, 1},
+            A_fp32.options());
+
+    cnrtQueue_t queue =
+        torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim;
+
+    if (M >= 1024)
+        dim = {32, 1, 1};
+    else if (M >= 256)
+        dim = {16, 1, 1};
+    else
+        dim = {8, 1, 1};
+
+    cnrtFunctionType_t ktype =
+        cnrtFuncTypeUnion1;
+
+    gemv_kernel<<<
+        dim,
+        ktype,
+        queue>>>(
+            A_fp32.data_ptr<float>(),
+            B_fp32.data_ptr<float>(),
+            C_fp32.data_ptr<float>(),
+            M,
+            K);
+
+    cnrtQueueSync(queue);
+
+    if (original_dtype != torch::kFloat) {
+        return C_fp32.to(original_dtype);
+    }
+
+    return C_fp32;
 }
