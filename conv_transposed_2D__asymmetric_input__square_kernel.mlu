@@ -1,0 +1,52 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void zero_kernel(float *out, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) out[idx] = 0.0f;
+}
+
+__mlu_entry__ void conv_transpose2d_kernel(float *x, float *weight, float *out, int in_channels, int out_channels, int h, int w, int kernel_size, int stride, int padding, int out_h, int out_w, int groups, int total_in) {
+    for (int idx = taskId; idx < total_in; idx += taskDim) {
+        int iw = idx % w;
+        int ih = (idx / w) % h;
+        int in_ch = (idx / (w * h)) % in_channels;
+        int batch = idx / (w * h * in_channels);
+        int in_per_group = in_channels / groups;
+        int out_per_group = out_channels / groups;
+        int group = in_ch / in_per_group;
+        float xv = x[idx];
+        for (int oc = 0; oc < out_per_group; ++oc) {
+            int out_ch = group * out_per_group + oc;
+            for (int kh = 0; kh < kernel_size; ++kh) {
+                for (int kw = 0; kw < kernel_size; ++kw) {
+                    int oh = ih * stride + kh - padding;
+                    int ow = iw * stride + kw - padding;
+                    if (oh >= 0 && oh < out_h && ow >= 0 && ow < out_w) {
+                        int out_idx = ((batch * out_channels + out_ch) * out_h + oh) * out_w + ow;
+                        float wv = weight[((in_ch * out_per_group + oc) * kernel_size + kh) * kernel_size + kw];
+                        out[out_idx] += xv * wv;
+                    }
+                }
+            }
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels, int out_channels, int kernel_size, int stride, int padding, int output_padding, int groups, bool bias) {
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
+    auto weight = kernel.contiguous().to(torch::kFloat).contiguous();
+    int batch = input.size(0), h = input.size(2), w = input.size(3);
+    int out_h = (h - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int out_w = (w - 1) * stride - 2 * padding + kernel_size + output_padding;
+    auto out = torch::empty({batch, out_channels, out_h, out_w}, input.options());
+    int total_out = batch * out_channels * out_h * out_w;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtDim3_t one = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    zero_kernel<<<dim, ktype, queue>>>(out.data_ptr<float>(), total_out);
+    conv_transpose2d_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), in_channels, out_channels, h, w, kernel_size, stride, padding, out_h, out_w, groups, input.numel());
+    cnrtQueueSync(queue);
+    return out.to(x.dtype());
+}

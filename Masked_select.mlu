@@ -1,0 +1,59 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define NRAM_SIZE 8192
+
+__mlu_entry__ void count_kernel(float *input, int *counts, int total, float threshold) {
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    __nram__ float buf[NRAM_SIZE];
+    int cnt = 0;
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        __memcpy(buf, input + start + done, len * sizeof(float), GDRAM2NRAM);
+        for (int i = 0; i < len; ++i) if (buf[i] > threshold) ++cnt;
+    }
+    counts[taskId] = cnt;
+}
+
+__mlu_entry__ void prefix_kernel(int *counts, int *offsets, int *total_out, int core_num) {
+    int sum = 0;
+    for (int i = 0; i < core_num; ++i) { offsets[i] = sum; sum += counts[i]; }
+    total_out[0] = sum;
+}
+
+__mlu_entry__ void select_kernel(float *input, float *out, int *offsets, int total, float threshold) {
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    __nram__ float buf[NRAM_SIZE];
+    int write_pos = offsets[taskId];
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        __memcpy(buf, input + start + done, len * sizeof(float), GDRAM2NRAM);
+        for (int i = 0; i < len; ++i)
+            if (buf[i] > threshold) out[write_pos++] = buf[i];
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, double threshold) {
+    auto x = input.contiguous().to(torch::kFloat).contiguous();
+    int total = x.numel();
+    auto counts = torch::empty({32}, input.options().dtype(torch::kInt));
+    auto offsets = torch::empty({32}, input.options().dtype(torch::kInt));
+    auto total_out = torch::empty({1}, input.options().dtype(torch::kInt));
+    auto out = torch::empty({total}, x.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtDim3_t one = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    count_kernel<<<dim, ktype, queue>>>(x.data_ptr<float>(), counts.data_ptr<int>(), total, (float)threshold);
+    prefix_kernel<<<one, cnrtFuncTypeBlock, queue>>>(counts.data_ptr<int>(), offsets.data_ptr<int>(), total_out.data_ptr<int>(), 32);
+    select_kernel<<<dim, ktype, queue>>>(x.data_ptr<float>(), out.data_ptr<float>(), offsets.data_ptr<int>(), total, (float)threshold);
+    cnrtQueueSync(queue);
+    return out.to(input.dtype());
+}

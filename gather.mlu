@@ -1,0 +1,46 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define NRAM_SIZE 4096
+
+__mlu_entry__ void gather_kernel(float *x, long *indices, long *bin_ids, float *weights, long *bins, float *out, int elements, int hidden, int top_k, int has_weights) {
+    __nram__ float buf[NRAM_SIZE];
+    for (int elem = taskId; elem < elements; elem += taskDim) {
+        int src_row = (int)indices[elem];
+        int bin_id = (int)bin_ids[elem];
+        int rank = elem - (int)bins[bin_id];
+        int dst_row = src_row * top_k + rank;
+        float scale = has_weights ? weights[elem] : 1.0f;
+        float *src = x + src_row * hidden;
+        float *dst = out + dst_row * hidden;
+        for (int done = 0; done < hidden; done += NRAM_SIZE) {
+            int len = (hidden - done) < NRAM_SIZE ? (hidden - done) : NRAM_SIZE;
+            int aligned_len = (len + 63) & ~63;
+            __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+            __bang_mul_scalar(buf, buf, scale, aligned_len);
+            __memcpy(dst + done, buf, len * sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+__mlu_entry__ void zero_kernel(float *out, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) out[idx] = 0.0f;
+}
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor indices, torch::Tensor bin_ids, torch::Tensor weights, torch::Tensor bins, int top_k) {
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
+    auto idx = indices.contiguous().to(torch::kLong).contiguous();
+    auto bid = bin_ids.contiguous().to(torch::kLong).contiguous();
+    auto w = weights.contiguous().to(torch::kFloat).contiguous();
+    auto b = bins.contiguous().to(torch::kLong).contiguous();
+    int tokens = input.size(0), hidden = input.size(1), elements = idx.numel();
+    auto out = torch::empty({tokens * top_k, hidden}, input.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    zero_kernel<<<dim, ktype, queue>>>(out.data_ptr<float>(), tokens * top_k * hidden);
+    gather_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), idx.data_ptr<long>(), bid.data_ptr<long>(), w.data_ptr<float>(), b.data_ptr<long>(), out.data_ptr<float>(), elements, hidden, top_k, weights.numel() > 0 ? 1 : 0);
+    cnrtQueueSync(queue);
+    return out.to(x.dtype());
+}

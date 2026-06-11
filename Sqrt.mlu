@@ -1,0 +1,36 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+
+#define NRAM_SIZE 8192
+
+__mlu_entry__ void sqrt_abs_kernel(float *input, float *output, int total) {
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    if (count == 0) return;
+    __nram__ float buf[NRAM_SIZE];
+    __nram__ float tmp[NRAM_SIZE];
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        int aligned_len = (len + 63) & ~63;
+        __memcpy(buf, input + start + done, len * sizeof(float), GDRAM2NRAM);
+        __bang_active_abs(buf, buf, aligned_len);
+        __bang_active_sqrt(tmp, buf, aligned_len);
+        __memcpy(output + start + done, tmp, len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
+    auto output = torch::empty_like(input);
+    int total = input.numel();
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    sqrt_abs_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), output.data_ptr<float>(), total);
+    cnrtQueueSync(queue);
+    return output.to(x.dtype());
+}

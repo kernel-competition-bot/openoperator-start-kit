@@ -1,0 +1,42 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+
+#define NRAM_SIZE 4096
+
+__mlu_entry__ void topk_kernel(float *x, float *values, long *indices, int rows, int cols, int k) {
+    __nram__ float buf[NRAM_SIZE];
+    for (int row = taskId; row < rows; row += taskDim) {
+        float *src = x + row * cols;
+        for (int out_col = 0; out_col < k; ++out_col) {
+            int best = 0;
+            float best_val = -3.402823466e+38F;
+            for (int done = 0; done < cols; done += NRAM_SIZE) {
+                int len = (cols - done) < NRAM_SIZE ? (cols - done) : NRAM_SIZE;
+                __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+                for (int i = 0; i < len; ++i) {
+                    int col = done + i;
+                    int used = 0;
+                    for (int p = 0; p < out_col; ++p) if (indices[row * k + p] == (long)col) used = 1;
+                    if (!used && buf[i] > best_val) { best_val = buf[i]; best = col; }
+                }
+            }
+            values[row * k + out_col] = best_val;
+            indices[row * k + out_col] = (long)best;
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
+    int rows = input.size(0), cols = input.size(1);
+    auto values = torch::empty({rows, k}, input.options());
+    auto indices = torch::empty({rows, k}, x.options().dtype(torch::kLong));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t d = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    topk_kernel<<<d, ktype, queue>>>(input.data_ptr<float>(), values.data_ptr<float>(), indices.data_ptr<long>(), rows, cols, k);
+    cnrtQueueSync(queue);
+    return {values.to(x.dtype()), indices};
+}

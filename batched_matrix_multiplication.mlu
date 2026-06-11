@@ -1,0 +1,43 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define NRAM_SIZE 4096
+
+// BMM: each output element = dot(A_row, B_col), tiled along K dimension
+__mlu_entry__ void bmm_kernel(float *a, float *b, float *out, int rows, int inner, int cols, int total) {
+    __nram__ float buf_a[NRAM_SIZE];
+    __nram__ float buf_b[NRAM_SIZE];
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int col = idx % cols;
+        int row = (idx / cols) % rows;
+        int batch = idx / (rows * cols);
+        float *a_row = a + batch * rows * inner + row * inner;
+        float *b_col = b + batch * inner * cols + col; // stride = cols
+        float sum = 0.0f;
+        for (int done = 0; done < inner; done += NRAM_SIZE) {
+            int len = (inner - done) < NRAM_SIZE ? (inner - done) : NRAM_SIZE;
+            __memcpy(buf_a, a_row + done, len * sizeof(float), GDRAM2NRAM);
+            // gather b column into buf_b
+            for (int i = 0; i < len; ++i) buf_b[i] = b_col[(done + i) * cols];
+            int aligned_len = (len + 63) & ~63;
+            __bang_mul(buf_a, buf_a, buf_b, aligned_len);
+            for (int i = 0; i < len; ++i) sum += buf_a[i];
+        }
+        out[idx] = sum;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    auto a = A.contiguous().to(torch::kFloat).contiguous();
+    auto b = B.contiguous().to(torch::kFloat).contiguous();
+    int batch = a.size(0), rows = a.size(1), inner = a.size(2), cols = b.size(2);
+    auto out = torch::empty({batch, rows, cols}, a.options());
+    int total = batch * rows * cols;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    bmm_kernel<<<dim, ktype, queue>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), rows, inner, cols, total);
+    cnrtQueueSync(queue);
+    return out.to(A.dtype());
+}

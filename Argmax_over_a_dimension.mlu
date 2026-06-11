@@ -1,0 +1,52 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define NRAM_SIZE 4096
+
+__mlu_entry__ void argmax_dim1_kernel(float *x, long *out, int rows, int cols) {
+    __nram__ float buf[NRAM_SIZE];
+    for (int row = taskId; row < rows; row += taskDim) {
+        float *src = x + row * cols;
+        int best = 0;
+        float best_val = -3.402823466e+38F;
+        for (int done = 0; done < cols; done += NRAM_SIZE) {
+            int len = (cols - done) < NRAM_SIZE ? (cols - done) : NRAM_SIZE;
+            __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+            for (int i = 0; i < len; ++i) {
+                if (buf[i] > best_val) { best_val = buf[i]; best = done + i; }
+            }
+        }
+        out[row] = (long)best;
+    }
+}
+
+__mlu_entry__ void argmax_dim0_kernel(float *x, long *out, int rows, int cols) {
+    for (int col = taskId; col < cols; col += taskDim) {
+        int best = 0;
+        float best_val = -3.402823466e+38F;
+        for (int r = 0; r < rows; ++r) {
+            float v = x[r * cols + col];
+            if (v > best_val) { best_val = v; best = r; }
+        }
+        out[col] = (long)best;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
+    int rows = input.size(0), cols = input.size(1);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t d = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    if (dim == 1 || dim == -1) {
+        auto out = torch::empty({rows}, x.options().dtype(torch::kLong));
+        argmax_dim1_kernel<<<d, ktype, queue>>>(input.data_ptr<float>(), out.data_ptr<long>(), rows, cols);
+        cnrtQueueSync(queue);
+        return out;
+    }
+    auto out = torch::empty({cols}, x.options().dtype(torch::kLong));
+    argmax_dim0_kernel<<<d, ktype, queue>>>(input.data_ptr<float>(), out.data_ptr<long>(), rows, cols);
+    cnrtQueueSync(queue);
+    return out;
+}

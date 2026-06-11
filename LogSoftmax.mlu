@@ -1,0 +1,51 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+
+#define NRAM_SIZE 4096
+
+__mlu_entry__ void logsoftmax_kernel(float *input, float *output, int rows, int cols) {
+    __nram__ float buf[NRAM_SIZE];
+    for (int row = taskId; row < rows; row += taskDim) {
+        float *src = input + row * cols;
+        float *dst = output + row * cols;
+        // Pass 1: find max
+        float max_val = -3.402823466e+38F;
+        for (int done = 0; done < cols; done += NRAM_SIZE) {
+            int len = (cols - done) < NRAM_SIZE ? (cols - done) : NRAM_SIZE;
+            __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+            for (int i = 0; i < len; ++i) if (buf[i] > max_val) max_val = buf[i];
+        }
+        // Pass 2: compute sum(exp(x - max))
+        float sum = 0.0f;
+        for (int done = 0; done < cols; done += NRAM_SIZE) {
+            int len = (cols - done) < NRAM_SIZE ? (cols - done) : NRAM_SIZE;
+            int aligned_len = (len + 63) & ~63;
+            __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+            __bang_sub_scalar(buf, buf, max_val, aligned_len);
+            for (int i = 0; i < len; ++i) sum += expf(buf[i]);
+        }
+        float log_sum = logf(sum) + max_val;
+        // Pass 3: output = x - log_sum
+        for (int done = 0; done < cols; done += NRAM_SIZE) {
+            int len = (cols - done) < NRAM_SIZE ? (cols - done) : NRAM_SIZE;
+            int aligned_len = (len + 63) & ~63;
+            __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+            __bang_sub_scalar(buf, buf, log_sum, aligned_len);
+            __memcpy(dst + done, buf, len * sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
+    auto output = torch::empty_like(input);
+    int rows = input.size(0), cols = input.size(1);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t d = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    logsoftmax_kernel<<<d, ktype, queue>>>(input.data_ptr<float>(), output.data_ptr<float>(), rows, cols);
+    cnrtQueueSync(queue);
+    return output.to(x.dtype());
+}
