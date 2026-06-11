@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 16384   // ✅ 提升带宽利用率（关键优化点）
+#define CHUNK_SIZE 16384
 
 __mlu_entry__ void gemv_kernel(
     float* A,
@@ -26,7 +26,6 @@ __mlu_entry__ void gemv_kernel(
     for (int row = start; row < end; ++row) {
 
         float acc = 0.0f;
-
         float* a_ptr = A + row * K;
 
         for (int offset = 0; offset < K; offset += CHUNK_SIZE) {
@@ -34,23 +33,15 @@ __mlu_entry__ void gemv_kernel(
             int len = K - offset;
             if (len > CHUNK_SIZE) len = CHUNK_SIZE;
 
-            // ===== GDRAM -> NRAM =====
-            __memcpy(nram_b,
-                     B + offset,
-                     len * sizeof(float),
-                     GDRAM2NRAM);
+            __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
+            __memcpy(nram_a, a_ptr + offset, len * sizeof(float), GDRAM2NRAM);
 
-            __memcpy(nram_a,
-                     a_ptr + offset,
-                     len * sizeof(float),
-                     GDRAM2NRAM);
-
-            // ===== 核心优化：直接 vector dot =====
-            float partial = 0.0f;
-
-            // 用 bang 的 reduce 版本（避免逐元素 loop）
             __bang_mul(nram_a, nram_a, nram_b, len);
-            __bang_reduce_sum(&partial, nram_a, len);
+
+            float partial = 0.0f;
+            for (int i = 0; i < len; ++i) {
+                partial += nram_a[i];
+            }
 
             acc += partial;
         }
