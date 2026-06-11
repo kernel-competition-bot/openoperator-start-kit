@@ -1,0 +1,28 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void zero_kernel(half *out, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) out[idx] = (half)0.0f;
+}
+
+__mlu_entry__ void scatter_add_kernel(half *src, long *index, half *out, int rows, int cols) {
+    for (int idx = taskId; idx < rows * cols; idx += taskDim) {
+        int col = idx % cols;
+        int row = idx / cols;
+        int dst_row = (int)index[row];
+        out[dst_row * cols + col] = (half)((float)out[dst_row * cols + col] + (float)src[idx]);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
+    auto input = src.contiguous();
+    auto idx = index.contiguous();
+    int rows = input.size(0), cols = input.size(1);
+    auto out = torch::empty({dim_size, cols}, input.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    zero_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)out.data_ptr(), dim_size * cols);
+    scatter_add_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), idx.data_ptr<long>(), (half *)out.data_ptr(), rows, cols);
+    return out;
+}

@@ -1,0 +1,38 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void dilated_conv2d_kernel(half *x, half *kernel, half *out, int in_channels, int out_channels, int height, int width, int kernel_size, int dilation, int padding, int out_h, int out_w, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int ow = idx % out_w;
+        int oh = (idx / out_w) % out_h;
+        int out_channel = (idx / (out_w * out_h)) % out_channels;
+        int batch_id = idx / (out_w * out_h * out_channels);
+        float sum = 0.0f;
+        for (int in_channel = 0; in_channel < in_channels; ++in_channel) {
+            for (int kh = 0; kh < kernel_size; ++kh) {
+                for (int kw = 0; kw < kernel_size; ++kw) {
+                    int ih = oh + kh * dilation - padding;
+                    int iw = ow + kw * dilation - padding;
+                    if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
+                        sum += (float)x[((batch_id * in_channels + in_channel) * height + ih) * width + iw] * (float)kernel[((out_channel * in_channels + in_channel) * kernel_size + kh) * kernel_size + kw];
+                    }
+                }
+            }
+        }
+        out[idx] = (half)sum;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, int in_channels, int out_channels, int kernel_size, int dilation, int padding) {
+    auto input = x.contiguous();
+    auto weight = kernel.contiguous();
+    int batch = input.size(0), height = input.size(2), width = input.size(3);
+    int out_h = height + 2 * padding - dilation * (kernel_size - 1);
+    int out_w = width + 2 * padding - dilation * (kernel_size - 1);
+    auto out = torch::empty({batch, out_channels, out_h, out_w}, input.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    dilated_conv2d_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)weight.data_ptr(), (half *)out.data_ptr(), in_channels, out_channels, height, width, kernel_size, dilation, padding, out_h, out_w, batch * out_channels * out_h * out_w);
+    return out;
+}

@@ -2,53 +2,18 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define NRAM_SIZE 8192
-
-__mlu_entry__ void matrix_scalar_mul_kernel(
-    float *input,
-    float *output,
-    int total,
-    float scalar) {
-
-    int remain = total % taskDim;
-    int per_core = total / taskDim;
-    int count = per_core + (int)(taskId < remain);
-    int start = per_core * taskId + (taskId < remain ? taskId : remain);
-
-    if (count == 0) return;
-
-    __nram__ float buf[NRAM_SIZE];
-
-    for (int done = 0; done < count; done += NRAM_SIZE) {
-        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
-        int aligned_len = (len + 63) & ~63;
-
-        __memcpy(buf, input + start + done, len * sizeof(float), GDRAM2NRAM);
-        __bang_mul_scalar(buf, buf, scalar, aligned_len);
-        __memcpy(output + start + done, buf, len * sizeof(float), NRAM2GDRAM);
+__mlu_entry__ void matrix_scalar_mul_kernel(half *input, half *output, int total, float scalar) {
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        output[idx] = (half)((float)input[idx] * scalar);
     }
 }
 
-
 torch::Tensor bang_func(torch::Tensor A, double s) {
-    auto A_contig = A.contiguous();
-    auto A_fp32 = A_contig.to(torch::kFloat).contiguous();
-
-    auto output = torch::empty_like(A_fp32);
-    int total = A_fp32.numel();
-
+    auto input = A.contiguous();
+    auto output = torch::empty_like(input);
+    int total = input.numel();
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim = {32, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
-
-    matrix_scalar_mul_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        output.data_ptr<float>(),
-        total,
-        (float)s
-    );
-
-    cnrtQueueSync(queue);
-    return output.to(A.dtype());
+    cnrtDim3_t task_dim = {32, 1, 1};
+    matrix_scalar_mul_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)output.data_ptr(), total, (float)s);
+    return output;
 }

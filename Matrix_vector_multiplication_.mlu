@@ -1,0 +1,22 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void gemv_kernel(half *a, half *b, half *out, int rows, int inner) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        float sum = 0.0f;
+        for (int k = 0; k < inner; ++k) sum += (float)a[row * inner + k] * (float)b[k];
+        out[row] = (half)sum;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    auto a = A.contiguous();
+    auto b = B.contiguous();
+    int rows = a.size(0), inner = a.size(1);
+    auto out = torch::empty({rows, 1}, a.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    gemv_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)a.data_ptr(), (half *)b.data_ptr(), (half *)out.data_ptr(), rows, inner);
+    return out;
+}

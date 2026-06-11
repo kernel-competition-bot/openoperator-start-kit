@@ -1,0 +1,39 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+
+__mlu_entry__ void batchnorm_kernel(half *x, half *out, int batch_size, int channels, int height, int width, int channel_size) {
+    for (int channel = taskId; channel < channels; channel += taskDim) {
+        float sum = 0.0f;
+        for (int batch = 0; batch < batch_size; ++batch)
+            for (int row = 0; row < height; ++row)
+                for (int col = 0; col < width; ++col)
+                    sum += (float)x[((batch * channels + channel) * height + row) * width + col];
+        float mean = sum / (float)channel_size;
+        float var_sum = 0.0f;
+        for (int batch = 0; batch < batch_size; ++batch)
+            for (int row = 0; row < height; ++row)
+                for (int col = 0; col < width; ++col) {
+                    float diff = (float)x[((batch * channels + channel) * height + row) * width + col] - mean;
+                    var_sum += diff * diff;
+                }
+        float inv_std = 1.0f / sqrtf(var_sum / (float)channel_size + 1e-5f);
+        for (int batch = 0; batch < batch_size; ++batch)
+            for (int row = 0; row < height; ++row)
+                for (int col = 0; col < width; ++col) {
+                    int idx = ((batch * channels + channel) * height + row) * width + col;
+                    out[idx] = (half)(((float)x[idx] - mean) * inv_std);
+                }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+    auto input = x.contiguous();
+    auto out = torch::empty_like(input);
+    int batch = input.size(0), channels = input.size(1), height = input.size(2), width = input.size(3);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    batchnorm_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)out.data_ptr(), batch, channels, height, width, batch * height * width);
+    return out;
+}

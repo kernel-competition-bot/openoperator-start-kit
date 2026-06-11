@@ -1,0 +1,35 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void cumsum_dim1_kernel(half *x, half *out, int rows, int cols) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        float sum = 0.0f;
+        for (int col = 0; col < cols; ++col) {
+            sum += (float)x[row * cols + col];
+            out[row * cols + col] = (half)sum;
+        }
+    }
+}
+
+__mlu_entry__ void cumsum_dim0_kernel(half *x, half *out, int rows, int cols) {
+    for (int col = taskId; col < cols; col += taskDim) {
+        float sum = 0.0f;
+        for (int row = 0; row < rows; ++row) {
+            sum += (float)x[row * cols + col];
+            out[row * cols + col] = (half)sum;
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    auto input = x.contiguous();
+    TORCH_CHECK(input.dim() == 2, "cumsum implementation expects 2D input");
+    int rows = input.size(0), cols = input.size(1);
+    auto out = torch::empty_like(input);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    if (dim == 0) cumsum_dim0_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)out.data_ptr(), rows, cols);
+    else cumsum_dim1_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)out.data_ptr(), rows, cols);
+    return out;
+}

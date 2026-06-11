@@ -1,0 +1,34 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <math.h>
+
+__mlu_entry__ void kl_kernel(half *input_log_prob, half *target_prob, float *partials, int total) {
+    float sum = 0.0f;
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        float target = (float)target_prob[idx];
+        if (target > 0.0f) sum += target * (logf(target) - (float)input_log_prob[idx]);
+    }
+    partials[taskId] = sum;
+}
+
+__mlu_entry__ void finalize_kl_kernel(float *partials, half *out, int batch) {
+    float sum = 0.0f;
+    for (int idx = 0; idx < 32; ++idx) sum += partials[idx];
+    out[0] = (half)(sum / (float)batch);
+}
+
+torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
+    auto input = input_log_prob.contiguous();
+    auto target = target_prob.contiguous();
+    auto out = torch::empty({}, input.options());
+    auto partials = torch::empty({32}, input.options().dtype(torch::kFloat));
+    int total = input.numel();
+    int batch = input.size(0);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    cnrtDim3_t one_dim = {1, 1, 1};
+    kl_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)target.data_ptr(), partials.data_ptr<float>(), total);
+    finalize_kl_kernel<<<one_dim, cnrtFuncTypeBlock, queue>>>(partials.data_ptr<float>(), (half *)out.data_ptr(), batch);
+    return out;
+}

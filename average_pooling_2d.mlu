@@ -1,0 +1,32 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+__mlu_entry__ void avg_pool2d_kernel(half *x, half *out, int channels, int height, int width, int kernel, int out_h, int out_w, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int ow = idx % out_w;
+        int oh = (idx / out_w) % out_h;
+        int channel = (idx / (out_w * out_h)) % channels;
+        int batch = idx / (out_w * out_h * channels);
+        float sum = 0.0f;
+        for (int kh = 0; kh < kernel; ++kh) {
+            for (int kw = 0; kw < kernel; ++kw) {
+                int ih = oh * kernel + kh;
+                int iw = ow * kernel + kw;
+                sum += (float)x[((batch * channels + channel) * height + ih) * width + iw];
+            }
+        }
+        out[idx] = (half)(sum / (float)(kernel * kernel));
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
+    auto input = x.contiguous();
+    int batch = input.size(0), channels = input.size(1), height = input.size(2), width = input.size(3);
+    int out_h = height / kernel_size, out_w = width / kernel_size;
+    auto out = torch::empty({batch, channels, out_h, out_w}, input.options());
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    avg_pool2d_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)out.data_ptr(), channels, height, width, kernel_size, out_h, out_w, batch * channels * out_h * out_w);
+    return out;
+}

@@ -1,0 +1,37 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+
+__mlu_entry__ void topk_kernel(half *x, half *values, long *indices, int rows, int cols, int k) {
+    for (int row = taskId; row < rows; row += taskDim) {
+        for (int out_col = 0; out_col < k; ++out_col) {
+            int best = 0;
+            float best_value = -3.402823466e+38F;
+            for (int col = 0; col < cols; ++col) {
+                float value = (float)x[row * cols + col];
+                int used = 0;
+                for (int prev = 0; prev < out_col; ++prev) if (indices[row * k + prev] == (long)col) used = 1;
+                if (!used && value > best_value) {
+                    best_value = value;
+                    best = col;
+                }
+            }
+            values[row * k + out_col] = (half)best_value;
+            indices[row * k + out_col] = (long)best;
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    auto input = x.contiguous();
+    TORCH_CHECK(input.dim() == 2, "TopK implementation expects 2D input");
+    TORCH_CHECK(dim == 1 || dim == -1, "TopK supports last dimension");
+    int rows = input.size(0), cols = input.size(1);
+    auto values = torch::empty({rows, k}, input.options());
+    auto indices = torch::empty({rows, k}, x.options().dtype(torch::kLong));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {32, 1, 1};
+    topk_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)values.data_ptr(), indices.data_ptr<long>(), rows, cols, k);
+    return {values, indices};
+}
