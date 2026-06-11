@@ -4,13 +4,12 @@
 
 #define CHUNK_SIZE 4096
 
-/* 多核余弦计算核函数 */
+/* 余弦计算核函数 */
 __mlu_entry__ void cos_kernel(
     float *input,
     float *output,
     int total) {
 
-    // 多核拆分参数
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = total / core_num;
@@ -21,7 +20,6 @@ __mlu_entry__ void cos_kernel(
     uint32_t count = per_core +
                      (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区
     __nram__ float nram_input[CHUNK_SIZE];
     __nram__ float nram_output[CHUNK_SIZE];
 
@@ -31,23 +29,19 @@ __mlu_entry__ void cos_kernel(
                 ? CHUNK_SIZE
                 : (count - offset);
 
-        // 对齐到 64 字节
         uint32_t aligned_len = (len + 63) & ~63;
 
-        // 从 GDRAM 搬运数据到 NRAM
         __memcpy(
             nram_input,
             input + start + offset,
             len * sizeof(float),
             GDRAM2NRAM);
 
-        // 计算余弦值
         __bang_cos(
             nram_output,
             nram_input,
             aligned_len);
 
-        // 将结果写回 GDRAM
         __memcpy(
             output + start + offset,
             nram_output,
@@ -56,16 +50,15 @@ __mlu_entry__ void cos_kernel(
     }
 }
 
-/* 包装函数：输入 torch::Tensor，返回各元素的余弦值 */
-torch::Tensor bang_cos(torch::Tensor input) {
+/* 入口函数，必须命名为 bang_func */
+torch::Tensor bang_func(
+    torch::Tensor input) {
+
     TORCH_CHECK(
         input.is_contiguous(),
         "Input must be contiguous");
 
-    // 保留原始 dtype
     auto original_dtype = input.scalar_type();
-
-    // 统一转为 float32 计算
     torch::Tensor input_fp32 = input;
     if (original_dtype != torch::kFloat) {
         input_fp32 = input.to(torch::kFloat);
@@ -74,7 +67,6 @@ torch::Tensor bang_cos(torch::Tensor input) {
     auto output_fp32 = torch::empty_like(input_fp32);
     int total = input_fp32.numel();
 
-    // 启动设备端核函数
     cnrtQueue_t queue = nullptr;
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
@@ -85,10 +77,8 @@ torch::Tensor bang_cos(torch::Tensor input) {
         total
     );
 
-    // 转回原始 dtype
     if (original_dtype != torch::kFloat) {
         return output_fp32.to(original_dtype);
     }
-
     return output_fp32;
 }
