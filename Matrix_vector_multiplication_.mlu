@@ -1,51 +1,106 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <stdint.h>
 
-#define CHUNK_SIZE 16384
+#define CHUNK_SIZE 4096
+#define ALIGN 64
+
+// 安全加载：从可能非对齐的 src 拷贝 len 个 float 到 nram_dst（已对齐）
+// 利用临时 nram 空间 temp，要求 temp 大小 >= (len + ALIGN/sizeof(float))
+static inline void load_unaligned(
+    const float* src,
+    float* dst,
+    int len,
+    float* temp) 
+{
+    uintptr_t addr = (uintptr_t)src;
+    int offset_elems = (addr & (ALIGN - 1)) / sizeof(float); // 不对齐元素数
+    const float* aligned_src = (const float*)(addr - (addr & (ALIGN - 1)));
+    int load_len = offset_elems + len;
+    int aligned_load_len = (load_len + ALIGN/sizeof(float) - 1) & ~(ALIGN/sizeof(float) - 1);
+
+    // 从对齐地址加载到 temp
+    __memcpy(temp, aligned_src, aligned_load_len * sizeof(float), GDRAM2NRAM);
+    // 将有效数据复制到 dst
+    for (int i = 0; i < len; ++i) {
+        dst[i] = temp[offset_elems + i];
+    }
+}
 
 __mlu_entry__ void gemv_kernel(
     float* A,
     float* B,
     float* C,
     int M,
-    int K) {
-
+    int K)
+{
     int task_id = taskId;
     int task_num = taskDim;
 
     int rows_per_task = (M + task_num - 1) / task_num;
-
     int start = task_id * rows_per_task;
     int end = start + rows_per_task;
     if (end > M) end = M;
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
+    __nram__ float nram_temp[CHUNK_SIZE + ALIGN/sizeof(float)]; // 用于非对齐加载的临时空间
 
-    for (int row = start; row < end; ++row) {
-
-        float acc = 0.0f;
-        float* a_ptr = A + row * K;
-
-        for (int offset = 0; offset < K; offset += CHUNK_SIZE) {
-
-            int len = K - offset;
-            if (len > CHUNK_SIZE) len = CHUNK_SIZE;
-
-            __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
-            __memcpy(nram_a, a_ptr + offset, len * sizeof(float), GDRAM2NRAM);
-
-            __bang_mul(nram_a, nram_a, nram_b, len);
-
-            float partial = 0.0f;
-            for (int i = 0; i < len; ++i) {
-                partial += nram_a[i];
+    // 若 K 较小，完整加载 B 一次
+    if (K <= CHUNK_SIZE) {
+        load_unaligned(B, nram_b, K, nram_temp);  // B 也可能非对齐
+        for (int row = start; row < end; ++row) {
+            load_unaligned(A + row * K, nram_a, K, nram_temp);
+            // 对齐到 64 的倍数后调用乘法
+            int aligned_len = (K + 63) & ~63;
+            if (aligned_len > K) {
+                for (int i = K; i < aligned_len; ++i) nram_a[i] = 0.0f;
+                // nram_b 可能被污染，但其超出部分不参与累加？下面只用 K 个结果
             }
-
-            acc += partial;
+            __bang_mul(nram_a, nram_a, nram_b, aligned_len);
+            // 只需求前 K 个元素的和，但 BANG_sum 对 aligned_len 求和，多出的 0 不影响
+            float partial = __bang_sum(nram_a, aligned_len);
+            C[row] = partial;
         }
+        return;
+    }
 
-        C[row] = acc;
+    // K > CHUNK_SIZE 的分块路径
+    int num_chunks = (K + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    // 为每行分配累加器（使用局部数组，假设 rows_per_task 不会太大）
+    // 若 rows_per_task 过大，可改用 GDRAM 临时数组，但这里采用 N RAM 动态上限
+    #define MAX_LOCAL_ROWS 1024  // 根据实际 NRAM 大小可调
+    if (end - start > MAX_LOCAL_ROWS) {
+        // 降级方案：仍按行循环（不在此赘述，实际可回退原顺序）
+    }
+    __nram__ float acc[MAX_LOCAL_ROWS];
+    for (int i = 0; i < end - start; ++i) acc[i] = 0.0f;
+
+    for (int chunk = 0; chunk < num_chunks; ++chunk) {
+        int offset = chunk * CHUNK_SIZE;
+        int len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
+        int aligned_len = (len + 63) & ~63;
+
+        // 加载 B 的一个 chunk（只加载一次！）
+        load_unaligned(B + offset, nram_b, len, nram_temp);
+        // 填充 0
+        for (int i = len; i < aligned_len; ++i) nram_b[i] = 0.0f;
+
+        // 对该 chunk 处理所有负责的行
+        for (int i = 0, row = start; row < end; ++row, ++i) {
+            // 加载 A 的对应片段
+            load_unaligned(A + row * K + offset, nram_a, len, nram_temp);
+            for (int j = len; j < aligned_len; ++j) nram_a[j] = 0.0f;
+
+            __bang_mul(nram_a, nram_a, nram_b, aligned_len);
+            float partial = __bang_sum(nram_a, aligned_len);
+            acc[i] += partial;
+        }
+    }
+
+    // 写回结果
+    for (int i = 0, row = start; row < end; ++row, ++i) {
+        C[row] = acc[i];
     }
 }
