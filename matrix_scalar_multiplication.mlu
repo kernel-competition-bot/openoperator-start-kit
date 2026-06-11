@@ -20,23 +20,23 @@ __mlu_entry__ void matrix_scalar_mul_kernel(
     uint32_t count = per_core +
                      (core_id < remainder ? 1 : 0);
 
+    if (count == 0) return;
+
     __nram__ float buf_in[2][CHUNK_SIZE];
     __nram__ float buf_out[CHUNK_SIZE];
 
     uint32_t num_chunks = (count + CHUNK_SIZE - 1) / CHUNK_SIZE;
     int cur = 0;
 
-    if (num_chunks > 0) {
-        uint32_t len0 = (count < CHUNK_SIZE) ? count : CHUNK_SIZE;
-        __memcpy_async(buf_in[0], input + start,
-                       len0 * sizeof(float), GDRAM2NRAM);
-    }
+    uint32_t len0 = (count < CHUNK_SIZE) ? count : CHUNK_SIZE;
+    __memcpy_async(buf_in[0], input + start,
+                   len0 * sizeof(float), GDRAM2NRAM);
 
     for (uint32_t i = 0; i < num_chunks; i++) {
         uint32_t offset = i * CHUNK_SIZE;
         uint32_t len = (offset + CHUNK_SIZE <= count)
                            ? CHUNK_SIZE : (count - offset);
-        uint32_t aligned_len = (len + 63) & ~63;
+        uint32_t aligned_len = (len + 127) & ~127;
 
         __sync_move();
 
@@ -67,7 +67,7 @@ torch::Tensor bang_func(torch::Tensor A, double s) {
 
     torch::Tensor A_fp32 = A;
     if (original_dtype != torch::kFloat) {
-        A_fp32 = A.to(torch::kFloat);
+        A_fp32 = A.to(torch::kFloat).contiguous();
     }
 
     auto output = torch::empty_like(A_fp32);
@@ -84,6 +84,8 @@ torch::Tensor bang_func(torch::Tensor A, double s) {
         total,
         (float)s
     );
+
+    cnrtQueueSync(queue);
 
     if (original_dtype != torch::kFloat) {
         return output.to(original_dtype);
