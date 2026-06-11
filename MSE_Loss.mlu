@@ -2,31 +2,33 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-__mlu_entry__ void mse_kernel(half *pred, half *target, float *partials, int total) {
+__mlu_entry__ void mse_kernel(float *pred, float *target, float *partials, int total) {
     float sum = 0.0f;
     for (int idx = taskId; idx < total; idx += taskDim) {
-        float diff = (float)pred[idx] - (float)target[idx];
+        float diff = pred[idx] - target[idx];
         sum += diff * diff;
     }
     partials[taskId] = sum;
 }
 
-__mlu_entry__ void finalize_mse_kernel(float *partials, half *out, int total) {
+__mlu_entry__ void finalize_mse_kernel(float *partials, float *out, int core_num, int total) {
     float sum = 0.0f;
-    for (int idx = 0; idx < 32; ++idx) sum += partials[idx];
-    out[0] = (half)(sum / (float)total);
+    for (int i = 0; i < core_num; ++i) sum += partials[i];
+    out[0] = sum / (float)total;
 }
 
 torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
-    auto pred = predictions.contiguous();
-    auto target = targets.contiguous();
+    auto pred = predictions.contiguous().to(torch::kFloat).contiguous();
+    auto target = targets.contiguous().to(torch::kFloat).contiguous();
     auto out = torch::empty({}, pred.options());
-    auto partials = torch::empty({32}, pred.options().dtype(torch::kFloat));
+    auto partials = torch::empty({32}, pred.options());
     int total = pred.numel();
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t task_dim = {32, 1, 1};
-    cnrtDim3_t one_dim = {1, 1, 1};
-    mse_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)pred.data_ptr(), (half *)target.data_ptr(), partials.data_ptr<float>(), total);
-    finalize_mse_kernel<<<one_dim, cnrtFuncTypeBlock, queue>>>(partials.data_ptr<float>(), (half *)out.data_ptr(), total);
-    return out;
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtDim3_t one = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    mse_kernel<<<dim, ktype, queue>>>(pred.data_ptr<float>(), target.data_ptr<float>(), partials.data_ptr<float>(), total);
+    finalize_mse_kernel<<<one, cnrtFuncTypeBlock, queue>>>(partials.data_ptr<float>(), out.data_ptr<float>(), 32, total);
+    cnrtQueueSync(queue);
+    return out.to(predictions.dtype());
 }

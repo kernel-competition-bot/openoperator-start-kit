@@ -2,27 +2,30 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-__mlu_entry__ void zero_kernel(half *out, int total) {
-    for (int idx = taskId; idx < total; idx += taskDim) out[idx] = (half)0.0f;
+__mlu_entry__ void zero_kernel(float *out, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) out[idx] = 0.0f;
 }
 
-__mlu_entry__ void scatter_add_kernel(half *src, long *index, half *out, int rows, int cols) {
+__mlu_entry__ void scatter_add_kernel(float *src, long *index, float *out, int rows, int cols) {
     for (int idx = taskId; idx < rows * cols; idx += taskDim) {
         int col = idx % cols;
         int row = idx / cols;
         int dst_row = (int)index[row];
-        out[dst_row * cols + col] = (half)((float)out[dst_row * cols + col] + (float)src[idx]);
+        out[dst_row * cols + col] += src[idx];
     }
 }
 
 torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
-    auto input = src.contiguous();
-    auto idx = index.contiguous();
+    auto input = src.contiguous().to(torch::kFloat).contiguous();
+    auto idx = index.contiguous().to(torch::kLong).contiguous();
     int rows = input.size(0), cols = input.size(1);
     auto out = torch::empty({dim_size, cols}, input.options());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t task_dim = {32, 1, 1};
-    zero_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)out.data_ptr(), dim_size * cols);
-    scatter_add_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), idx.data_ptr<long>(), (half *)out.data_ptr(), rows, cols);
-    return out;
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtDim3_t one = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    zero_kernel<<<dim, ktype, queue>>>(out.data_ptr<float>(), dim_size * cols);
+    scatter_add_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), idx.data_ptr<long>(), out.data_ptr<float>(), rows, cols);
+    cnrtQueueSync(queue);
+    return out.to(src.dtype());
 }

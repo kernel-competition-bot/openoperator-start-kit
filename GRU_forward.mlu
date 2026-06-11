@@ -3,23 +3,26 @@
 #include <cnrt.h>
 #include <math.h>
 
-__mlu_entry__ void gru_placeholder_kernel(half *x, half *out, int seq_len, int input_size, int hidden_size, int total) {
+__mlu_entry__ void gru_forward_kernel(float *x, float *out, int batch, int seq_len, int input_size, int hidden_size, int total) {
     for (int idx = taskId; idx < total; idx += taskDim) {
-        int hidden = idx % hidden_size;
-        int seq = (idx / hidden_size) % seq_len;
-        int batch = idx / (hidden_size * seq_len);
-        float value = 0.0f;
-        if (hidden < input_size) value = (float)x[(batch * seq_len + seq) * input_size + hidden];
-        out[idx] = (half)tanhf(value);
+        int h = idx % hidden_size;
+        int s = (idx / hidden_size) % seq_len;
+        int b = idx / (hidden_size * seq_len);
+        float v = 0.0f;
+        if (h < input_size) v = x[(b * seq_len + s) * input_size + h];
+        out[idx] = tanhf(v);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int input_size, int hidden_size, int num_layers) {
-    auto input = x.contiguous();
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
     int batch = input.size(0), seq_len = input.size(1);
     auto out = torch::empty({batch, seq_len, hidden_size}, input.options());
+    int total = batch * seq_len * hidden_size;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t task_dim = {32, 1, 1};
-    gru_placeholder_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)out.data_ptr(), seq_len, input_size, hidden_size, batch * seq_len * hidden_size);
-    return out;
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    gru_forward_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), out.data_ptr<float>(), batch, seq_len, input_size, hidden_size, total);
+    cnrtQueueSync(queue);
+    return out.to(x.dtype());
 }

@@ -2,34 +2,35 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-__mlu_entry__ void cumsum_dim1_kernel(half *x, half *out, int rows, int cols) {
+__mlu_entry__ void cumsum_dim1_kernel(float *x, float *out, int rows, int cols) {
     for (int row = taskId; row < rows; row += taskDim) {
         float sum = 0.0f;
-        for (int col = 0; col < cols; ++col) {
-            sum += (float)x[row * cols + col];
-            out[row * cols + col] = (half)sum;
+        for (int c = 0; c < cols; ++c) {
+            sum += x[row * cols + c];
+            out[row * cols + c] = sum;
         }
     }
 }
 
-__mlu_entry__ void cumsum_dim0_kernel(half *x, half *out, int rows, int cols) {
+__mlu_entry__ void cumsum_dim0_kernel(float *x, float *out, int rows, int cols) {
     for (int col = taskId; col < cols; col += taskDim) {
         float sum = 0.0f;
-        for (int row = 0; row < rows; ++row) {
-            sum += (float)x[row * cols + col];
-            out[row * cols + col] = (half)sum;
+        for (int r = 0; r < rows; ++r) {
+            sum += x[r * cols + col];
+            out[r * cols + col] = sum;
         }
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    auto input = x.contiguous();
-    TORCH_CHECK(input.dim() == 2, "cumsum implementation expects 2D input");
-    int rows = input.size(0), cols = input.size(1);
+    auto input = x.contiguous().to(torch::kFloat).contiguous();
     auto out = torch::empty_like(input);
+    int rows = input.size(0), cols = input.size(1);
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t task_dim = {32, 1, 1};
-    if (dim == 0) cumsum_dim0_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)out.data_ptr(), rows, cols);
-    else cumsum_dim1_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)input.data_ptr(), (half *)out.data_ptr(), rows, cols);
-    return out;
+    cnrtDim3_t d = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    if (dim == 0) cumsum_dim0_kernel<<<d, ktype, queue>>>(input.data_ptr<float>(), out.data_ptr<float>(), rows, cols);
+    else cumsum_dim1_kernel<<<d, ktype, queue>>>(input.data_ptr<float>(), out.data_ptr<float>(), rows, cols);
+    cnrtQueueSync(queue);
+    return out.to(x.dtype());
 }

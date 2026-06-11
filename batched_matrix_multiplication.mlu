@@ -2,24 +2,27 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-__mlu_entry__ void bmm_kernel(half *a, half *b, half *out, int rows, int inner, int cols, int total) {
+__mlu_entry__ void bmm_kernel(float *a, float *b, float *out, int rows, int inner, int cols, int total) {
     for (int idx = taskId; idx < total; idx += taskDim) {
         int col = idx % cols;
         int row = (idx / cols) % rows;
         int batch_id = idx / (rows * cols);
         float sum = 0.0f;
-        for (int k = 0; k < inner; ++k) sum += (float)a[batch_id * rows * inner + row * inner + k] * (float)b[batch_id * inner * cols + k * cols + col];
-        out[idx] = (half)sum;
+        for (int k = 0; k < inner; ++k) sum += a[batch_id * rows * inner + row * inner + k] * b[batch_id * inner * cols + k * cols + col];
+        out[idx] = sum;
     }
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    auto a = A.contiguous();
-    auto b = B.contiguous();
+    auto a = A.contiguous().to(torch::kFloat).contiguous();
+    auto b = B.contiguous().to(torch::kFloat).contiguous();
     int batch = a.size(0), rows = a.size(1), inner = a.size(2), cols = b.size(2);
     auto out = torch::empty({batch, rows, cols}, a.options());
+    int total = batch * rows * cols;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t task_dim = {32, 1, 1};
-    bmm_kernel<<<task_dim, cnrtFuncTypeUnion8, queue>>>((half *)a.data_ptr(), (half *)b.data_ptr(), (half *)out.data_ptr(), rows, inner, cols, batch * rows * cols);
-    return out;
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    bmm_kernel<<<dim, ktype, queue>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), rows, inner, cols, total);
+    cnrtQueueSync(queue);
+    return out.to(A.dtype());
 }

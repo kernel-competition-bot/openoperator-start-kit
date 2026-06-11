@@ -2,21 +2,36 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 8192
+#define NRAM_SIZE 8192
 
-__mlu_entry__ void leakyrelu_kernel(half *input, half *output, int total, float negative_slope) {
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        float value = (float)input[idx];
-        output[idx] = (half)(value > 0.0f ? value : value * negative_slope);
+__mlu_entry__ void leakyrelu_kernel(float *input, float *output, int total, float negative_slope) {
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    if (count == 0) return;
+    __nram__ float buf[NRAM_SIZE];
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        int aligned_len = (len + 63) & ~63;
+        __memcpy(buf, input + start + done, len * sizeof(float), GDRAM2NRAM);
+        __nram__ float tmp[NRAM_SIZE];
+        __bang_active_relu(tmp, buf, aligned_len);
+        __bang_sub(buf, buf, tmp, aligned_len);
+        __bang_mul_scalar(buf, buf, negative_slope, aligned_len);
+        __bang_add(buf, buf, tmp, aligned_len);
+        __memcpy(output + start + done, buf, len * sizeof(float), NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
-    auto x = input.contiguous();
+    auto x = input.contiguous().to(torch::kFloat).contiguous();
     auto output = torch::empty_like(x);
     int total = x.numel();
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {32, 1, 1};
-    leakyrelu_kernel<<<dim, cnrtFuncTypeUnion8, queue>>>((half *)x.data_ptr(), (half *)output.data_ptr(), total, (float)negative_slope);
-    return output;
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
+    leakyrelu_kernel<<<dim, ktype, queue>>>(x.data_ptr<float>(), output.data_ptr<float>(), total, (float)negative_slope);
+    cnrtQueueSync(queue);
+    return output.to(input.dtype());
 }
