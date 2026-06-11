@@ -1,75 +1,49 @@
 #include <bang.h>
-#include <torch/extension.h>
-#include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+#define CHUNK_SIZE 1024  // 可调
 
-__mlu_entry__ void gemv_kernel(
-    float* A,
-    float* B,
-    float* C,
+__mlu_entry__ void bang_func(
+    float* A,      // M x K
+    float* x,      // K
+    float* y,      // M
     int M,
-    int K) {
+    int K
+){
+    int tid = taskId;
+    int tnum = taskDim;
 
-    int task_id = taskId;
-    int task_num = taskDim;
-
-    int rows_per_task = (M + task_num - 1) / task_num;
-
-    int start = task_id * rows_per_task;
-    int end = start + rows_per_task;
-    if (end > M) end = M;
+    int rows_per_task = (M + tnum - 1)/tnum;
+    int row_start = tid * rows_per_task;
+    int row_end   = (row_start + rows_per_task > M) ? M : row_start + rows_per_task;
 
     __nram__ float nram_a[CHUNK_SIZE];
-    __nram__ float nram_b[CHUNK_SIZE];
+    __nram__ float nram_x[CHUNK_SIZE];
 
-    for (int row = start; row < end; ++row) {
+    for(int r=row_start; r<row_end; r++){
+        float acc = 0.f;
 
-        float acc = 0.0f;
+        for(int offset=0; offset<K; offset+=CHUNK_SIZE){
+            int len = (offset+CHUNK_SIZE <= K) ? CHUNK_SIZE : K - offset;
+            int aligned_len = (len+63)&~63; // 64 对齐
 
-        for (int offset = 0; offset < K; offset += CHUNK_SIZE) {
-
-            int len = (offset + CHUNK_SIZE <= K)
-                      ? CHUNK_SIZE
-                      : (K - offset);
-
-            int aligned_len = (len + 63) & ~63;
-
-            // load B
-            __memcpy(nram_b,
-                     B + offset,
-                     len * sizeof(float),
-                     GDRAM2NRAM);
-
-            // load A
-            __memcpy(nram_a,
-                     A + row * K + offset,
-                     len * sizeof(float),
-                     GDRAM2NRAM);
+            // load A row
+            __memcpy(nram_a, A + r*K + offset, len*sizeof(float), GDRAM2NRAM);
+            // load x
+            __memcpy(nram_x, x + offset, len*sizeof(float), GDRAM2NRAM);
 
             // padding
-            for (int i = len; i < aligned_len; ++i) {
-                nram_a[i] = 0.0f;
-                nram_b[i] = 0.0f;
+            for(int i=len; i<aligned_len; i++){
+                nram_a[i] = 0.f;
+                nram_x[i] = 0.f;
             }
 
-            // ⚠️ MUST use aligned_len here
-            __bang_mul(nram_a,
-                       nram_a,
-                       nram_b,
-                       aligned_len);
+            // element-wise multiply
+            __bang_mul(nram_a, nram_a, nram_x, aligned_len);
 
-            // ⚠️ reduce ONLY real length
-            float partial = 0.0f;
-
-            #pragma unroll 8
-            for (int i = 0; i < len; ++i) {
-                partial += nram_a[i];
-            }
-
-            acc += partial;
+            // accumulate
+            for(int i=0;i<len;i++) acc += nram_a[i];
         }
 
-        C[row] = acc;
+        y[r] = acc;
     }
 }
