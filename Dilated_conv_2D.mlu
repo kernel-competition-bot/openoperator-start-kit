@@ -36,15 +36,18 @@ __mlu_entry__ void dilated_conv2d_kernel(
     // 各维度步长
     int in_batch_stride   = C_in * H * W;
     int in_channel_stride = H * W;
-    int in_row_stride     = W;
     int w_oc_stride       = C_in * kH * kW;
     int w_ic_stride       = kH * kW;
     int out_batch_stride  = C_out * H_out * W_out;
     int out_oc_stride     = H_out * W_out;
-    int out_row_stride    = W_out;
 
-    // NRAM 缓冲区
-    __nram__ float nram_out[256];       // 输出行累加器
+    // ---- NRAM 缓冲区 ----
+    // 按输出宽度分块，固定行缓冲大小，避免 W_out 较大时临时缓冲互相覆盖。
+    const int TILE_W = 256;
+    const int TILE_ELEMS = 8192;
+    __nram__ float nram_out[TILE_ELEMS];
+    __nram__ float nram_in[TILE_W];
+    __nram__ float nram_tmp[TILE_W];
 
     // ========================================================================
     // 每个 core 处理分配给它的 (n, oc) 对
@@ -53,50 +56,80 @@ __mlu_entry__ void dilated_conv2d_kernel(
         uint32_t task_idx = start + t;
         int n  = (int)(task_idx / (uint32_t)C_out);
         int oc = (int)(task_idx % (uint32_t)C_out);
+        float* out_gdram = output + n * out_batch_stride + oc * out_oc_stride;
 
-        // 逐行处理输出
-        for (int oh = 0; oh < H_out; oh++) {
-            // 清零输出行
-            __bang_write_zero(nram_out, 256);
+        for (int ow_tile_start = 0; ow_tile_start < W_out; ow_tile_start += TILE_W) {
+            int cur_tile_w = W_out - ow_tile_start;
+            if (cur_tile_w > TILE_W) cur_tile_w = TILE_W;
 
-            // 遍历所有输入通道
-            for (int ic = 0; ic < C_in; ic++) {
-                // 加载 kernel 基址
-                const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
+            int tile_h = TILE_ELEMS / cur_tile_w;
+            if (tile_h < 1) tile_h = 1;
 
-                // 对每个输出列进行精确计算
-                for (int ow = 0; ow < W_out; ow++) {
-                    float sum = 0.0f;
+            for (int oh_tile_start = 0; oh_tile_start < H_out; oh_tile_start += tile_h) {
+                int oh_tile_end = oh_tile_start + tile_h;
+                if (oh_tile_end > H_out) oh_tile_end = H_out;
+                int cur_tile_h = oh_tile_end - oh_tile_start;
+                int out_tile_size = cur_tile_h * cur_tile_w;
 
-                    // 对 kernel 中的每个元素
+                __bang_write_zero(nram_out, out_tile_size);
+
+                for (int ic = 0; ic < C_in; ic++) {
+                    const float* in_ch_base =
+                        input + n * in_batch_stride + ic * in_channel_stride;
+                    const float* w_base =
+                        weight + oc * w_oc_stride + ic * w_ic_stride;
+
                     for (int kh = 0; kh < kH; kh++) {
-                        int ih = oh * stride_h + kh * dilation_h - padding_h;
+                        for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
+                            int ih = oh * stride_h + kh * dilation_h - padding_h;
+                            if (ih < 0 || ih >= H) continue;
 
-                        for (int kw = 0; kw < kW; kw++) {
-                            int iw = ow * stride_w + kw * dilation_w - padding_w;
+                            int nram_out_row = oh - oh_tile_start;
 
-                            // 边界检查 - 关键精度修复
-                            if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                                // 计算线性索引并直接读取
-                                int in_idx = n * in_batch_stride + ic * in_channel_stride + ih * in_row_stride + iw;
-                                int w_idx = kh * kW + kw;
+                            for (int kw = 0; kw < kW; kw++) {
+                                float w_val = w_base[kh * kW + kw];
+                                if (w_val == 0.0f) continue;
 
-                                float in_val = input[in_idx];
-                                float w_val = w_base[w_idx];
-                                sum += in_val * w_val;
+                                int iw_offset = kw * dilation_w - padding_w;
+                                int ow_start = ow_tile_start;
+                                int ow_end = ow_tile_start + cur_tile_w;
+
+                                int valid_ow_start = -iw_offset;
+                                if (valid_ow_start < ow_start) valid_ow_start = ow_start;
+                                int valid_ow_end = W - iw_offset;
+                                if (valid_ow_end > ow_end) valid_ow_end = ow_end;
+
+                                int valid_w = valid_ow_end - valid_ow_start;
+                                if (valid_w <= 0) continue;
+
+                                int iw_start = valid_ow_start + iw_offset;
+                                int out_offset = nram_out_row * cur_tile_w +
+                                                 (valid_ow_start - ow_tile_start);
+
+                                __memcpy(
+                                    nram_in,
+                                    in_ch_base + ih * W + iw_start,
+                                    valid_w * sizeof(float),
+                                    GDRAM2NRAM);
+                                __bang_mul_scalar(nram_tmp, nram_in, w_val, valid_w);
+                                __bang_add(
+                                    nram_out + out_offset,
+                                    nram_out + out_offset,
+                                    nram_tmp,
+                                    valid_w);
                             }
-                            // 超出边界的输入视为 0，不贡献
                         }
                     }
+                }
 
-                    // 累加到输出
-                    nram_out[ow] += sum;
+                for (int oh = 0; oh < cur_tile_h; oh++) {
+                    __memcpy(
+                        out_gdram + (oh_tile_start + oh) * W_out + ow_tile_start,
+                        nram_out + oh * cur_tile_w,
+                        cur_tile_w * sizeof(float),
+                        NRAM2GDRAM);
                 }
             }
-
-            // 写回 GDRAM
-            int out_idx = n * out_batch_stride + oc * out_oc_stride + oh * out_row_stride;
-            __memcpy(output + out_idx, nram_out, W_out * sizeof(float), NRAM2GDRAM);
         }
     }
 }
@@ -146,14 +179,13 @@ torch::Tensor bang_func(
     TORCH_CHECK(x.dim() == 4,           "Input must be 4D: [N, C, H, W]");
     TORCH_CHECK(kernel.dim() == 4,      "Kernel must be 4D: [C_out, C_in, kH, kW]");
 
-    // 保留原始 dtype
-    auto original_dtype = x.scalar_type();
-
     // -------- 统一转为 float32 计算 --------
     torch::Tensor x_fp32      = x;
     torch::Tensor kernel_fp32 = kernel;
-    if (original_dtype != torch::kFloat) {
+    if (x.scalar_type() != torch::kFloat) {
         x_fp32      = x.to(torch::kFloat);
+    }
+    if (kernel.scalar_type() != torch::kFloat) {
         kernel_fp32 = kernel.to(torch::kFloat);
     }
 
@@ -206,11 +238,6 @@ torch::Tensor bang_func(
         stride, stride,
         padding, padding,
         dilation, dilation);
-
-    // -------- 转回原 dtype --------
-    if (original_dtype != torch::kFloat) {
-        return output_fp32.to(original_dtype);
-    }
 
     return output_fp32;
 }
