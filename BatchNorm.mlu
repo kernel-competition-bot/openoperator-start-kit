@@ -3,28 +3,49 @@
 #include <cnrt.h>
 #include <math.h>
 
-__mlu_entry__ void batchnorm_kernel(float *x, float *out, int batch, int channels, int h, int w, int channel_size) {
+#define NRAM_SIZE 8192
+
+__mlu_entry__ void batchnorm_kernel(float *x, float *out, int batch, int channels, int h, int w, int hw, int channel_size) {
+    __nram__ float buf[NRAM_SIZE];
     for (int ch = taskId; ch < channels; ch += taskDim) {
+        // Pass 1: compute mean
         float sum = 0.0f;
-        for (int n = 0; n < batch; ++n)
-            for (int row = 0; row < h; ++row)
-                for (int col = 0; col < w; ++col)
-                    sum += x[((n * channels + ch) * h + row) * w + col];
+        for (int n = 0; n < batch; ++n) {
+            float *src = x + (n * channels + ch) * hw;
+            for (int done = 0; done < hw; done += NRAM_SIZE) {
+                int len = (hw - done) < NRAM_SIZE ? (hw - done) : NRAM_SIZE;
+                __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+                for (int i = 0; i < len; ++i) sum += buf[i];
+            }
+        }
         float mean = sum / (float)channel_size;
+        // Pass 2: compute variance
         float var_sum = 0.0f;
-        for (int n = 0; n < batch; ++n)
-            for (int row = 0; row < h; ++row)
-                for (int col = 0; col < w; ++col) {
-                    float diff = x[((n * channels + ch) * h + row) * w + col] - mean;
-                    var_sum += diff * diff;
-                }
+        for (int n = 0; n < batch; ++n) {
+            float *src = x + (n * channels + ch) * hw;
+            for (int done = 0; done < hw; done += NRAM_SIZE) {
+                int len = (hw - done) < NRAM_SIZE ? (hw - done) : NRAM_SIZE;
+                int aligned_len = (len + 63) & ~63;
+                __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+                __bang_sub_scalar(buf, buf, mean, aligned_len);
+                __bang_mul(buf, buf, buf, aligned_len);
+                for (int i = 0; i < len; ++i) var_sum += buf[i];
+            }
+        }
         float inv_std = 1.0f / sqrtf(var_sum / (float)channel_size + 1e-5f);
-        for (int n = 0; n < batch; ++n)
-            for (int row = 0; row < h; ++row)
-                for (int col = 0; col < w; ++col) {
-                    int idx = ((n * channels + ch) * h + row) * w + col;
-                    out[idx] = (x[idx] - mean) * inv_std;
-                }
+        // Pass 3: normalize
+        for (int n = 0; n < batch; ++n) {
+            float *src = x + (n * channels + ch) * hw;
+            float *dst = out + (n * channels + ch) * hw;
+            for (int done = 0; done < hw; done += NRAM_SIZE) {
+                int len = (hw - done) < NRAM_SIZE ? (hw - done) : NRAM_SIZE;
+                int aligned_len = (len + 63) & ~63;
+                __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+                __bang_sub_scalar(buf, buf, mean, aligned_len);
+                __bang_mul_scalar(buf, buf, inv_std, aligned_len);
+                __memcpy(dst + done, buf, len * sizeof(float), NRAM2GDRAM);
+            }
+        }
     }
 }
 
@@ -35,7 +56,7 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {32, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
-    batchnorm_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), out.data_ptr<float>(), batch, channels, h, w, batch * h * w);
+    batchnorm_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), out.data_ptr<float>(), batch, channels, h, w, h * w, batch * h * w);
     cnrtQueueSync(queue);
     return out.to(x.dtype());
 }

@@ -2,22 +2,38 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#define NRAM_SIZE 4096
+
 __mlu_entry__ void cumsum_dim1_kernel(float *x, float *out, int rows, int cols) {
+    __nram__ float buf[NRAM_SIZE];
     for (int row = taskId; row < rows; row += taskDim) {
-        float sum = 0.0f;
-        for (int c = 0; c < cols; ++c) {
-            sum += x[row * cols + c];
-            out[row * cols + c] = sum;
+        float *src = x + row * cols;
+        float *dst = out + row * cols;
+        float running_sum = 0.0f;
+        for (int done = 0; done < cols; done += NRAM_SIZE) {
+            int len = (cols - done) < NRAM_SIZE ? (cols - done) : NRAM_SIZE;
+            __memcpy(buf, src + done, len * sizeof(float), GDRAM2NRAM);
+            for (int i = 0; i < len; ++i) {
+                running_sum += buf[i];
+                buf[i] = running_sum;
+            }
+            __memcpy(dst + done, buf, len * sizeof(float), NRAM2GDRAM);
         }
     }
 }
 
 __mlu_entry__ void cumsum_dim0_kernel(float *x, float *out, int rows, int cols) {
-    for (int col = taskId; col < cols; col += taskDim) {
-        float sum = 0.0f;
+    __nram__ float buf[NRAM_SIZE];
+    __nram__ float acc[NRAM_SIZE];
+    for (int col_start = taskId * NRAM_SIZE; col_start < cols; col_start += taskDim * NRAM_SIZE) {
+        int len = (cols - col_start) < NRAM_SIZE ? (cols - col_start) : NRAM_SIZE;
+        int aligned_len = (len + 63) & ~63;
+        // zero accumulator
+        for (int i = 0; i < aligned_len; ++i) acc[i] = 0.0f;
         for (int r = 0; r < rows; ++r) {
-            sum += x[r * cols + col];
-            out[r * cols + col] = sum;
+            __memcpy(buf, x + r * cols + col_start, len * sizeof(float), GDRAM2NRAM);
+            __bang_add(acc, acc, buf, aligned_len);
+            __memcpy(out + r * cols + col_start, acc, len * sizeof(float), NRAM2GDRAM);
         }
     }
 }

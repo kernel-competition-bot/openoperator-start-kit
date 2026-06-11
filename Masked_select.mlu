@@ -2,11 +2,21 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#define NRAM_SIZE 8192
+
 __mlu_entry__ void count_kernel(float *input, int *counts, int total, float threshold) {
-    int count = 0;
-    for (int idx = taskId; idx < total; idx += taskDim)
-        if (input[idx] > threshold) ++count;
-    counts[taskId] = count;
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    __nram__ float buf[NRAM_SIZE];
+    int cnt = 0;
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        __memcpy(buf, input + start + done, len * sizeof(float), GDRAM2NRAM);
+        for (int i = 0; i < len; ++i) if (buf[i] > threshold) ++cnt;
+    }
+    counts[taskId] = cnt;
 }
 
 __mlu_entry__ void prefix_kernel(int *counts, int *offsets, int *total_out, int core_num) {
@@ -16,9 +26,18 @@ __mlu_entry__ void prefix_kernel(int *counts, int *offsets, int *total_out, int 
 }
 
 __mlu_entry__ void select_kernel(float *input, float *out, int *offsets, int total, float threshold) {
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    __nram__ float buf[NRAM_SIZE];
     int write_pos = offsets[taskId];
-    for (int idx = taskId; idx < total; idx += taskDim)
-        if (input[idx] > threshold) out[write_pos++] = input[idx];
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        __memcpy(buf, input + start + done, len * sizeof(float), GDRAM2NRAM);
+        for (int i = 0; i < len; ++i)
+            if (buf[i] > threshold) out[write_pos++] = buf[i];
+    }
 }
 
 torch::Tensor bang_func(torch::Tensor input, double threshold) {

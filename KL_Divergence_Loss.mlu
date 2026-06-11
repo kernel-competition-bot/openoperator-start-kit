@@ -3,11 +3,30 @@
 #include <cnrt.h>
 #include <math.h>
 
+#define NRAM_SIZE 8192
+
 __mlu_entry__ void kl_kernel(float *input_log_prob, float *target_prob, float *partials, int total) {
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    if (count == 0) { partials[taskId] = 0.0f; return; }
+    __nram__ float buf_input[NRAM_SIZE];
+    __nram__ float buf_target[NRAM_SIZE];
+    __nram__ float buf_tmp[NRAM_SIZE];
     float sum = 0.0f;
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        float t = target_prob[idx];
-        if (t > 0.0f) sum += t * (logf(t) - input_log_prob[idx]);
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        int aligned_len = (len + 63) & ~63;
+        __memcpy(buf_input, input_log_prob + start + done, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(buf_target, target_prob + start + done, len * sizeof(float), GDRAM2NRAM);
+        // target * (log(target) - input_log_prob)
+        __bang_active_loghp(buf_tmp, buf_target, aligned_len);  // log(target)
+        __bang_sub(buf_tmp, buf_tmp, buf_input, aligned_len);   // log(target) - input
+        __bang_mul(buf_tmp, buf_tmp, buf_target, aligned_len);  // target * (...)
+        for (int i = 0; i < len; ++i) {
+            if (buf_target[i] > 0.0f) sum += buf_tmp[i];
+        }
     }
     partials[taskId] = sum;
 }

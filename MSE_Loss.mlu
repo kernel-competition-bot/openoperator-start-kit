@@ -2,11 +2,25 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#define NRAM_SIZE 8192
+
 __mlu_entry__ void mse_kernel(float *pred, float *target, float *partials, int total) {
+    int remain = total % taskDim;
+    int per_core = total / taskDim;
+    int count = per_core + (int)(taskId < remain);
+    int start = per_core * taskId + (taskId < remain ? taskId : remain);
+    if (count == 0) { partials[taskId] = 0.0f; return; }
+    __nram__ float buf_pred[NRAM_SIZE];
+    __nram__ float buf_target[NRAM_SIZE];
     float sum = 0.0f;
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        float diff = pred[idx] - target[idx];
-        sum += diff * diff;
+    for (int done = 0; done < count; done += NRAM_SIZE) {
+        int len = (count - done) < NRAM_SIZE ? (count - done) : NRAM_SIZE;
+        int aligned_len = (len + 63) & ~63;
+        __memcpy(buf_pred, pred + start + done, len * sizeof(float), GDRAM2NRAM);
+        __memcpy(buf_target, target + start + done, len * sizeof(float), GDRAM2NRAM);
+        __bang_sub(buf_pred, buf_pred, buf_target, aligned_len);
+        __bang_mul(buf_pred, buf_pred, buf_pred, aligned_len);
+        for (int i = 0; i < len; ++i) sum += buf_pred[i];
     }
     partials[taskId] = sum;
 }

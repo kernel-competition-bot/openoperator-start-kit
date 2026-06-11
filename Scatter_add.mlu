@@ -2,17 +2,29 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-__mlu_entry__ void zero_kernel(float *out, int total) {
-    for (int idx = taskId; idx < total; idx += taskDim) out[idx] = 0.0f;
-}
+#define NRAM_SIZE 4096
 
 __mlu_entry__ void scatter_add_kernel(float *src, long *index, float *out, int rows, int cols) {
-    for (int idx = taskId; idx < rows * cols; idx += taskDim) {
-        int col = idx % cols;
-        int row = idx / cols;
+    __nram__ float buf[NRAM_SIZE];
+    for (int row = taskId; row < rows; row += taskDim) {
         int dst_row = (int)index[row];
-        out[dst_row * cols + col] += src[idx];
+        float *s = src + row * cols;
+        float *d = out + dst_row * cols;
+        for (int done = 0; done < cols; done += NRAM_SIZE) {
+            int len = (cols - done) < NRAM_SIZE ? (cols - done) : NRAM_SIZE;
+            // read-modify-write: no race because one core per row
+            __memcpy(buf, d + done, len * sizeof(float), GDRAM2NRAM);
+            __nram__ float buf_s[NRAM_SIZE];
+            __memcpy(buf_s, s + done, len * sizeof(float), GDRAM2NRAM);
+            int aligned_len = (len + 63) & ~63;
+            __bang_add(buf, buf, buf_s, aligned_len);
+            __memcpy(d + done, buf, len * sizeof(float), NRAM2GDRAM);
+        }
     }
+}
+
+__mlu_entry__ void zero_kernel(float *out, int total) {
+    for (int idx = taskId; idx < total; idx += taskDim) out[idx] = 0.0f;
 }
 
 torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
@@ -22,7 +34,6 @@ torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
     auto out = torch::empty({dim_size, cols}, input.options());
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {32, 1, 1};
-    cnrtDim3_t one = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion8;
     zero_kernel<<<dim, ktype, queue>>>(out.data_ptr<float>(), dim_size * cols);
     scatter_add_kernel<<<dim, ktype, queue>>>(input.data_ptr<float>(), idx.data_ptr<long>(), out.data_ptr<float>(), rows, cols);
