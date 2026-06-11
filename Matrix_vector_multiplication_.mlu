@@ -2,137 +2,86 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+#define CHUNK_SIZE 2048
 
 __mlu_entry__ void gemv_kernel(
-    float *A,
-    float *B,
-    float *C,
+    float* A,
+    float* B,
+    float* C,
     int M,
     int K) {
 
-    uint32_t task_id = taskId;
-    uint32_t task_num = taskDim;
+    const int task_id = taskId;
+    const int task_num = taskDim;
 
-    uint32_t per_task = M / task_num;
-    uint32_t remainder = M % task_num;
+    const int rows_per_task =
+        (M + task_num - 1) / task_num;
 
-    uint32_t start_row =
-        task_id * per_task +
-        (task_id < remainder ? task_id : remainder);
+    const int start_row =
+        task_id * rows_per_task;
 
-    uint32_t count =
-        per_task +
-        (task_id < remainder ? 1 : 0);
+    int end_row =
+        start_row + rows_per_task;
+
+    if (end_row > M) {
+        end_row = M;
+    }
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
 
-    for (uint32_t row_idx = 0; row_idx < count; ++row_idx) {
+    for (int row = start_row;
+         row < end_row;
+         ++row) {
 
-        uint32_t row = start_row + row_idx;
+        float sum = 0.0f;
 
-        float acc = 0.0f;
-        float comp = 0.0f;
-
-        for (uint32_t offset = 0;
+        for (int offset = 0;
              offset < K;
              offset += CHUNK_SIZE) {
 
-            uint32_t len =
+            int len =
                 (offset + CHUNK_SIZE <= K)
                 ? CHUNK_SIZE
                 : (K - offset);
 
-            uint32_t aligned_len =
-                (len + 63) & ~63;
-
-            // Load B chunk
             __memcpy(
                 nram_b,
                 B + offset,
                 len * sizeof(float),
                 GDRAM2NRAM);
 
-            // Padding
-            for (uint32_t j = len;
-                 j < aligned_len;
-                 ++j) {
-                nram_b[j] = 0.0f;
-            }
-
-            // Load A chunk
             __memcpy(
                 nram_a,
                 A + row * K + offset,
                 len * sizeof(float),
                 GDRAM2NRAM);
 
-            for (uint32_t j = len;
-                 j < aligned_len;
-                 ++j) {
-                nram_a[j] = 0.0f;
-            }
-
-            // Vector multiply
             __bang_mul(
                 nram_a,
                 nram_a,
                 nram_b,
-                aligned_len);
+                len);
 
-            // Kahan reduction
-            float partial_sum = 0.0f;
-            float partial_comp = 0.0f;
+            float partial = 0.0f;
 
-            for (uint32_t j = 0;
-                 j < len;
-                 ++j) {
-
-                float y =
-                    nram_a[j] -
-                    partial_comp;
-
-                float t =
-                    partial_sum +
-                    y;
-
-                partial_comp =
-                    (t - partial_sum) - y;
-
-                partial_sum = t;
+            #pragma unroll 8
+            for (int i = 0;
+                 i < len;
+                 ++i) {
+                partial += nram_a[i];
             }
 
-            // Merge block sum
-            float y =
-                partial_sum -
-                comp;
-
-            float t =
-                acc +
-                y;
-
-            comp =
-                (t - acc) - y;
-
-            acc = t;
+            sum += partial;
         }
 
-        C[row] = acc;
+        C[row] = sum;
     }
 }
 
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
-
-    TORCH_CHECK(
-        A.is_contiguous(),
-        "A must be contiguous");
-
-    TORCH_CHECK(
-        B.is_contiguous(),
-        "B must be contiguous");
 
     TORCH_CHECK(
         A.dim() == 2,
@@ -147,36 +96,48 @@ torch::Tensor bang_func(
         A.size(1) == B.size(0),
         "Shape mismatch");
 
+    TORCH_CHECK(
+        A.is_contiguous(),
+        "A must be contiguous");
+
+    TORCH_CHECK(
+        B.is_contiguous(),
+        "B must be contiguous");
+
     int M = A.size(0);
     int K = A.size(1);
 
     auto original_dtype =
         A.scalar_type();
 
-    torch::Tensor A_fp32 = A;
-    torch::Tensor B_fp32 = B;
+    auto A_fp32 =
+        A.contiguous().to(torch::kFloat);
 
-    if (original_dtype != torch::kFloat) {
-        A_fp32 = A.to(torch::kFloat);
-        B_fp32 = B.to(torch::kFloat);
-    }
+    auto B_fp32 =
+        B.contiguous().to(torch::kFloat);
 
     auto C_fp32 =
-        torch::empty(
+        torch::zeros(
             {M, 1},
             A_fp32.options());
 
     cnrtQueue_t queue =
         torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim;
+    uint32_t core_num;
 
-    if (M >= 1024)
-        dim = {32, 1, 1};
-    else if (M >= 256)
-        dim = {16, 1, 1};
+    if (M < 64)
+        core_num = 4;
+    else if (M < 512)
+        core_num = 16;
     else
-        dim = {8, 1, 1};
+        core_num = 32;
+
+    cnrtDim3_t dim = {
+        core_num,
+        1,
+        1
+    };
 
     cnrtFunctionType_t ktype =
         cnrtFuncTypeUnion1;
